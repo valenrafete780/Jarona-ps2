@@ -192,7 +192,7 @@ static void bg_poll(void)
 
 typedef struct { const char *name; float weight; } Item;
 static const Item ITEMS[] = {
-    { "TEX.DAT", 3.7f }, { "JARONA.PCM", 0.06f }, { "ULTIMO.PCM", 0.15f }, { "PODER.PCM", 0.2f }, { "OMEGA.PCM", 0.2f },
+    { "TEX.DAT", 0.9f }, { "SFX.DAT", 0.6f },
 };
 #define N_ITEMS ((int)(sizeof ITEMS / sizeof ITEMS[0]))
 static float item_base, item_weight, total_weight;
@@ -251,16 +251,20 @@ int game_load(void)
 
     /* 2) audio: efectos y musica por separado, listos para mezclarse */
     cur_show_title = 1;
-    static const struct { const char *f; int id; } sfxs[] = {
-        { "JARONA.PCM", SFX_JARONA }, { "ULTIMO.PCM", SFX_ULTIMO }, { "PODER.PCM", SFX_PODER }, { "OMEGA.PCM", SFX_OMEGA } };
     mixer_ensure_init();
-    for (int i = 1; i < N_ITEMS; i++) {
+    {
         uint32_t n = 0;
-        int16_t *pcm = (int16_t *)load_item(i, &n);
-        if (!pcm) { fprintf(stderr, "falta %s\n", ITEMS[i].name); gstate = G_ERROR; return -1; }
-        for (unsigned k = 0; k < sizeof sfxs / sizeof sfxs[0]; k++)
-            if (strcmp(ITEMS[i].name, sfxs[k].f) == 0) mixer_set_sfx(sfxs[k].id, pcm, n / 2);
-        item_base += ITEMS[i].weight;
+        const uint8_t *sfx = (const uint8_t *)load_item(1, &n);
+        if (!sfx || n < 20 || memcmp(sfx, "JSFX", 4) != 0) { plat_log("falta SFX.DAT"); gstate = G_ERROR; return -1; }
+        uint32_t sz[4]; memcpy(sz, sfx + 4, 16);
+        uint32_t off = 20;
+        static const int ids[4] = { SFX_JARONA, SFX_ULTIMO, SFX_PODER, SFX_OMEGA };
+        for (int k = 0; k < 4; k++) {
+            if (off + sz[k] > n) { plat_log("SFX.DAT corto"); gstate = G_ERROR; return -1; }
+            mixer_set_sfx(ids[k], (const int16_t *)(sfx + off), sz[k] / 2);
+            off += sz[k];
+        }
+        item_base += ITEMS[1].weight;
         draw_bar_screen(1, item_base / total_weight);
     }
     draw_bar_screen(1, 1.0f);

@@ -18,6 +18,7 @@
 #include <gsKit.h>
 #include <dmaKit.h>
 #include <libpad.h>
+#include <sbv_patches.h>
 #include <audsrv.h>
 
 #include "platform.h"
@@ -26,8 +27,6 @@
 #include "dbgfont.h"
 
 /* modulos IOP incrustados en el ELF (los genera el Makefile con bin2c) */
-extern unsigned char sio2man_irx[]; extern unsigned int size_sio2man_irx;
-extern unsigned char padman_irx[];  extern unsigned int size_padman_irx;
 extern unsigned char libsd_irx[];   extern unsigned int size_libsd_irx;
 extern unsigned char audsrv_irx[];  extern unsigned int size_audsrv_irx;
 
@@ -69,7 +68,7 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
     if (!buf) { printf("JARONA: sin memoria para %s (%ld bytes)\n", name, n); fclose(f); return NULL; }
     long done = 0;
     while (done < n) {
-        long k = n - done > 131072 ? 131072 : n - done;
+        long k = n - done > 1048576 ? 1048576 : n - done;
         long r = (long)fread(buf + done, 1, (size_t)k, f);
         if (r <= 0) break;
         done += r;
@@ -261,8 +260,8 @@ void gfx_end(void)
     }
 #ifndef NO_DEBUG_DOTS
     /* Fila 1: mando | audio | etapa de audsrv_init (gris = hilo sin arrancar, amarillo = esperando, verde = hecho).
-     * Fila 2: modulos IOP: SIO2MAN y PADMAN (BIOS), libsd, audsrv, libsd (BIOS, 2o intento), audsrv (2o), sio2man y padman
-     *         incrustados, libsd y audsrv (3er intento). Gris = sin intentar, verde = cargado, rojo = fallo. */
+     * Fila 2: modulos IOP: SIO2MAN y PADMAN (BIOS), libsd, audsrv, libsd (BIOS, 2o intento), audsrv (2o), (sin usar)
+     *         (sin usar), libsd y audsrv (3er intento). Gris = sin intentar, verde = cargado, rojo = fallo. */
     gsKit_prim_sprite(gs, 4, 4, 14, 14, 3, dot(pad_ready ? 1 : 0));
     gsKit_prim_sprite(gs, 18, 4, 28, 14, 3, dot(audio_ready ? 1 : (audio_failed ? -1 : 0)));
     gsKit_prim_sprite(gs, 32, 4, 42, 14, 3, dot(audio_stage == 0 ? 9 : (audio_stage == 1 ? 0 : 1)));
@@ -309,7 +308,7 @@ static void loader_thread(void *arg)
         long done = 0;
         if (buf) {
             while (done < n) {                                        /* este hilo se duerme esperando al disco; el juego no */
-                long k = n - done > 65536 ? 65536 : n - done;
+                long k = n - done > 1048576 ? 1048576 : n - done;
                 long r = (long)fread(buf + done, 1, (size_t)k, f);
                 if (r <= 0) break;
                 done += r;
@@ -465,21 +464,22 @@ int main(int argc, char **argv)
 {
     set_base_dir(argc > 0 ? argv[0] : NULL);
     SifInitRpc(0);
+    /* IMPRESCINDIBLE: sin este parche la BIOS no soporta SifExecModuleBuffer: devuelve "exito" sin cargar nada
+     * (los modulos incrustados salian con ID=319488 = una direccion del IOP, no un identificador de modulo). */
+    int lmb = sbv_patch_enable_lmb();
+    int pfx = sbv_patch_disable_prefix_check();
     ChangeThreadPriority(GetThreadId(), 0x40);
 
     mixer_ensure_init();                                              /* antes de que exista ningun hilo de audio */
     gfx_init();
     stage(1, "graficos iniciados");
 
-    /* Mando: en tu emulador hacen falta los modulos de la BIOS Y los incrustados. Se cargan seguidos y NO se espera:
-     * el hilo del mando se despierta solo cuando padman responde, mientras el juego carga. */
+    /* Mando: modulos de la BIOS (funcionan). El hilo del mando se despierta solo cuando padman responde. */
     mod_state[0] = load_rom("rom0:SIO2MAN");
     mod_state[1] = load_rom("rom0:PADMAN");
-    mod_state[6] = load_irx(sio2man_irx, size_sio2man_irx, "sio2man");
-    mod_state[7] = load_irx(padman_irx, size_padman_irx, "padman");
     pad_start();
     stage(2, "mando (arranca en segundo plano)");
-    dbg_log("build 6 - registro en pantalla");
+    dbg_log("build 7 - parche LMB=%d/%d", lmb, pfx);
 
     /* Audio: tambien en segundo plano; asi puede arrancar mientras se leen los datos del disco */
     mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd");
