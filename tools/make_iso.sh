@@ -4,14 +4,15 @@
 set -e
 ELF="${1:-JARONA.ELF}"; ISO="${2:-JARONA.ISO}"; REGION="${3:-NTSC}"
 [ -f "$ELF" ] || { echo "No existe $ELF (compila primero con make)"; exit 1; }
-for f in TEX.DAT JARONA.PCM ULTIMO.PCM PODER.PCM OMEGA.PCM SECRETO.PCM MUSICA.PCM; do
+FILES="TEX.DAT TREE.DAT JARONA.PCM ULTIMO.PCM PODER.PCM OMEGA.PCM SECRETO.ULW MUSICA.ULW"
+for f in $FILES; do
   [ -f "data/$f" ] || { echo "Falta data/$f: ejecuta antes  python3 tools/convert_assets.py ../jarona"; exit 1; }
 done
 if [ "$REGION" = "PAL" ]; then BOOT=SLES_000.01; else BOOT=SLUS_000.01; REGION=NTSC; fi
 
 rm -rf iso_root && mkdir iso_root
 cp "$ELF" "iso_root/$BOOT"
-cp data/TEX.DAT data/*.PCM iso_root/
+for f in $FILES; do cp "data/$f" iso_root/; done      # solo lo necesario (ignora ficheros antiguos de data/)
 printf 'BOOT2 = cdrom0:\\%s;1\r\nVER = 1.00\r\nVMODE = %s\r\n' "$BOOT" "$REGION" > iso_root/SYSTEM.CNF
 
 if   command -v mkisofs    >/dev/null 2>&1; then MK="mkisofs"

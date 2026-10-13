@@ -2,8 +2,10 @@
 """
 Convierte jarona/index.html + jarona/audio/*.mp3 en los datos que lee la version PS2:
 
-  data/TEX.DAT   todas las texturas (RGBA8, sin relleno) con una tabla de nombres
-  data/*.PCM     audio crudo s16le, mono, 22050 Hz (musica y efectos por separado)
+  data/TEX.DAT     texturas (RGBA8, sin relleno) con una tabla de nombres
+  data/TREE.DAT    escena secreta (gif) en 8 bits con paleta: se carga en segundo plano
+  data/*.PCM       efectos: s16le, mono, 22050 Hz
+  data/*.ULW       musica y pista secreta: mu-law de 8 bits, mono, 22050 Hz (la mitad de tamano, ~37 dB SNR)
 
 Uso:  python3 tools/convert_assets.py ../jarona  [--font /ruta/fuente.ttf]
 Requiere: Pillow y ffmpeg.
@@ -52,9 +54,11 @@ for i in range(count):
     add("om%02d" % i, sheet.crop((x, y, x + w, y + h)))
 
 tree = b64img(re.search(r'<img class="tree"[^>]*src="data:image/gif;base64,([A-Za-z0-9+/=]+)"', html).group(1))
+tree_frames, tree_ms = [], []
 for i in range(tree.n_frames):
     tree.seek(i)
-    add("tree%02d" % i, tree.convert("RGBA"))   # convert() compone cada fotograma completo
+    tree_frames.append(tree.convert("RGBA"))    # convert() compone cada fotograma completo
+    tree_ms.append(int(tree.info.get("duration", 100)))
 
 # ---------------- sombra del suelo (gradiente radial del CSS) ----------------
 fw, fh = 102, 18
@@ -131,9 +135,30 @@ with open(os.path.join(args.out, "TEX.DAT"), "wb") as f:
         f.write(b)
 print("TEX.DAT: %d texturas, %.2f MB" % (len(textures), off / 1048576))
 
+# ---------------- TREE.DAT (8 bits + paleta) ----------------
+pal = []
+for fr in tree_frames:
+    for px in fr.getdata():
+        if px not in pal:
+            pal.append(px)
+if len(pal) > 256:
+    sys.exit("El gif tiene %d colores: no cabe en 8 bits" % len(pal))
+index = {p: i for i, p in enumerate(pal)}
+tw, th = tree_frames[0].size
+with open(os.path.join(args.out, "TREE.DAT"), "wb") as f:
+    f.write(b"JTRE" + struct.pack("<IIII", len(tree_frames), tw, th, len(pal)))
+    f.write(struct.pack("<%dI" % len(tree_ms), *tree_ms))
+    for p in pal:
+        f.write(bytes(p))
+    for fr in tree_frames:
+        f.write(bytes(index[p] for p in fr.getdata()))
+print("TREE.DAT: %d fotogramas, %d colores, %.2f MB" % (len(tree_frames), len(pal), os.path.getsize(os.path.join(args.out, "TREE.DAT")) / 1048576))
+
 # ---------------- audio (cada pista por separado: asi se pueden mezclar) ----------------
-for name in ("jarona", "ultimo", "poder", "omega", "secreto", "musica"):
+for name, fmt, ext in (("jarona", "s16le", "PCM"), ("ultimo", "s16le", "PCM"), ("poder", "s16le", "PCM"), ("omega", "s16le", "PCM"),
+                       ("secreto", "mulaw", "ULW"), ("musica", "mulaw", "ULW")):
     src = os.path.join(args.src, "audio", name + ".mp3")
-    dst = os.path.join(args.out, name.upper() + ".PCM")
-    subprocess.check_call(["ffmpeg", "-y", "-v", "error", "-i", src, "-ac", "1", "-ar", "22050", "-f", "s16le", dst])
-    print("%s: %.1f s" % (os.path.basename(dst), os.path.getsize(dst) / 2 / 22050))
+    dst = os.path.join(args.out, name.upper() + "." + ext)
+    subprocess.check_call(["ffmpeg", "-y", "-v", "error", "-i", src, "-ac", "1", "-ar", "22050", "-f", fmt, dst])
+    bps = 2 if fmt == "s16le" else 1
+    print("%s: %.1f s, %.2f MB" % (os.path.basename(dst), os.path.getsize(dst) / bps / 22050, os.path.getsize(dst) / 1048576))
