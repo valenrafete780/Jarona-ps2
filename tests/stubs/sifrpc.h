@@ -1,0 +1,1 @@
+int SifInitRpc(int);
