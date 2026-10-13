@@ -183,9 +183,9 @@ static void bg_poll(void)
         int r = plat_async_poll(i, &data, &size);
         if (r == 0) break;                                   /* se cargan en orden: si esta no esta, las siguientes tampoco */
         bg_done[i] = 1;
-        if (r < 0 || !data) { fprintf(stderr, "fallo al cargar %s\n", BG_FILES[i]); continue; }
-        if (i == 0) { mixer_set_music((const uint8_t *)data, size); music_loaded = 1; if (music_wanted) mixer_music_start(); }
-        else if (i == 1) mixer_set_secret((const uint8_t *)data, size);
+        if (r < 0 || !data) { plat_log("fallo cargando un fichero"); continue; }
+        if (i == 0) { plat_log("musica lista"); mixer_set_music((const uint8_t *)data, size); music_loaded = 1; if (music_wanted) mixer_music_start(); }
+        else if (i == 1) { mixer_set_secret((const uint8_t *)data, size); plat_log("pista secreta lista"); }
         else tree_init((const uint8_t *)data, size);
     }
 }
@@ -281,12 +281,12 @@ static void tree_expand(int f)
 static void tree_init(const uint8_t *d, uint32_t size)
 {
     uint32_t hdr[4];
-    if (size < 20 || memcmp(d, "JTRE", 4) != 0) return;
+    if (size < 20 || memcmp(d, "JTRE", 4) != 0) { plat_log("arbol: cabecera mala"); return; }
     memcpy(hdr, d + 4, 16);
     uint32_t count = hdr[0], w = hdr[1], h = hdr[2], ncol = hdr[3];
-    if (count == 0 || count > MAX_TREE || ncol > 256 || w == 0 || h == 0) return;
+    if (count == 0 || count > MAX_TREE || ncol > 256 || w == 0 || h == 0) { plat_log("arbol: datos raros"); return; }
     uint32_t off = 20;
-    if (size < off + count * 4 + ncol * 4 + count * w * h) return;
+    if (size < off + count * 4 + ncol * 4 + count * w * h) { plat_log("arbol: fichero corto"); return; }
     for (uint32_t i = 0; i < count; i++) { uint32_t ms; memcpy(&ms, d + off + i * 4, 4); tree_ms[i] = (int32_t)ms; }
     off += count * 4;
     memset(tree_pal, 0, sizeof tree_pal);
@@ -300,9 +300,10 @@ static void tree_init(const uint8_t *d, uint32_t size)
     for (uint32_t i = 0; i < w * h; i++) memcpy(tree_rgba + (size_t)i * 4, tree_pal + (size_t)tree_idx[0][i] * 4, 4);
     t_tree.w = tree_w; t_tree.h = tree_h;
     t_tree.id = gfx_tex_create(tree_w, tree_h, tree_rgba, 0);
-    if (t_tree.id < 0) return;
+    if (t_tree.id < 0) { plat_log("arbol: SIN VRAM"); return; }
     tree_cur = 0;
     tree_ready = 1;
+    plat_log("arbol listo");
 }
 
 /* ---------------- dibujo: utilidades ---------------- */
@@ -458,7 +459,12 @@ static void slide_done(void)
 
 static void open_secret(void)
 {
-    if (secret_on || !mixer_has_secret() || !tree_ready) return;
+    if (secret_on) return;
+    if (!mixer_has_secret() || !tree_ready) {
+        static int said;
+        if (!said) { said = 1; plat_log(mixer_has_secret() ? "secreto: falta el arbol" : "secreto: falta el audio"); }
+        return;
+    }
     secret_on = 1;                                   /* no hay salida: solo reiniciando la consola */
     mixer_enter_secret();                            /* calla musica y efectos, suena "secreto" en bucle */
     secret_t0 = g_now;

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
+#include <stdarg.h>
 #include <tamtypes.h>
 #include <kernel.h>
 #include <sifrpc.h>
@@ -22,6 +23,7 @@
 #include "platform.h"
 #include "game.h"
 #include "mixer.h"
+#include "dbgfont.h"
 
 /* modulos IOP incrustados en el ELF (los genera el Makefile con bin2c) */
 extern unsigned char sio2man_irx[]; extern unsigned int size_sio2man_irx;
@@ -77,6 +79,51 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
     if (done != n) { free(buf); return NULL; }
     *size = (uint32_t)n;
     return buf;
+}
+
+/* =============================== registro en pantalla =============================== */
+/* Muchos emuladores no dejan leer la consola: el juego escribe aqui lo que pasa (abajo a la izquierda). */
+#define LOG_COLS  32
+#define LOG_LINES 14
+static char logl[LOG_LINES][LOG_COLS + 1];
+static volatile int log_dirty;
+
+static void dbg_log(const char *fmt, ...)
+{
+    char tmp[96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof tmp, fmt, ap);
+    va_end(ap);
+    printf("JARONA: %s\n", tmp);
+    for (int i = 0; i < LOG_LINES - 1; i++) memcpy(logl[i], logl[i + 1], LOG_COLS + 1);
+    memset(logl[LOG_LINES - 1], 0, LOG_COLS + 1);
+    strncpy(logl[LOG_LINES - 1], tmp, LOG_COLS);
+    log_dirty = 1;
+}
+
+void plat_log(const char *msg) { dbg_log("%s", msg); }
+
+#define LOGW (LOG_COLS * 6)
+#define LOGH (LOG_LINES * 8)
+static uint8_t log_px[LOGW * LOGH * 4];
+
+static void log_render(void)
+{
+    for (int i = 0; i < LOGW * LOGH; i++) { log_px[i * 4] = 0; log_px[i * 4 + 1] = 0; log_px[i * 4 + 2] = 0; log_px[i * 4 + 3] = 170; }
+    for (int l = 0; l < LOG_LINES; l++)
+        for (int c = 0; c < LOG_COLS && logl[l][c]; c++) {
+            int ch = (unsigned char)logl[l][c];
+            if (ch >= 'a' && ch <= 'z') ch -= 32;
+            if (ch < 32 || ch > 95) ch = '?';
+            const unsigned char *g = dbg_font[ch - 32];
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 6; x++)
+                    if (g[y] & (0x80 >> x)) {
+                        uint8_t *p = &log_px[(((l * 8) + y) * LOGW + c * 6 + x) * 4];
+                        p[0] = p[1] = p[2] = 255; p[3] = 255;
+                    }
+        }
 }
 
 /* =============================== graficos =============================== */
@@ -202,8 +249,16 @@ static u64 dot(int s)      /* 1 verde, 0 amarillo (esperando), -1 rojo, 9 gris (
     return GS_SETREG_RGBAQ(230, 200, 0, 0x80, 0);
 }
 
+static int log_tex = -1;
+
 void gfx_end(void)
 {
+    if (log_tex < 0 && nptex < MAX_TEX) { log_render(); log_tex = gfx_tex_create(LOGW, LOGH, log_px, 0); }
+    if (log_tex >= 0) {
+        if (log_dirty) { log_dirty = 0; log_render(); gfx_tex_update(log_tex, log_px); }
+        float y = (float)gs->Height - LOGH - 4, c[8] = { 4, y, 4 + LOGW, y, 4 + LOGW, y + LOGH, 4, y + LOGH };
+        gfx_quad(log_tex, c, 1.0f);
+    }
 #ifndef NO_DEBUG_DOTS
     /* Fila 1: mando | audio | etapa de audsrv_init (gris = hilo sin arrancar, amarillo = esperando, verde = hecho).
      * Fila 2: modulos IOP: SIO2MAN y PADMAN (BIOS), libsd, audsrv, libsd (BIOS, 2o intento), audsrv (2o), sio2man y padman
@@ -246,7 +301,7 @@ static void loader_thread(void *arg)
     (void)arg;
     for (int i = 0; i < a_n; i++) {
         FILE *f = open_data(a_names[i]);
-        if (!f) { printf("JARONA: no encuentro %s\n", a_names[i]); ares[i].state = -1; continue; }
+        if (!f) { dbg_log("%s: NO ENCONTRADO", a_names[i]); ares[i].state = -1; continue; }
         fseek(f, 0, SEEK_END);
         long n = ftell(f);
         fseek(f, 0, SEEK_SET);
@@ -261,11 +316,11 @@ static void loader_thread(void *arg)
             }
         }
         fclose(f);
-        if (!buf || done != n) { free(buf); printf("JARONA: lectura incompleta de %s\n", a_names[i]); ares[i].state = -1; continue; }
+        if (!buf || done != n) { free(buf); dbg_log("%s: lectura incompleta", a_names[i]); ares[i].state = -1; continue; }
         ares[i].data = buf; ares[i].size = (uint32_t)n;
         __sync_synchronize();
         ares[i].state = 1;
-        printf("JARONA: %s cargado en segundo plano (%ld bytes)\n", a_names[i], n);
+        dbg_log("%s cargado %ldK", a_names[i], n / 1024);
     }
     ExitDeleteThread();
 }
@@ -274,6 +329,7 @@ void plat_async_begin(const char *const *names, int n)
 {
     a_names = names;
     a_n = n < 8 ? n : 8;
+    dbg_log("carga en 2o plano: %d ficheros", a_n);
     start_thread(loader_thread, loader_stack, sizeof loader_stack, 0x58);   /* por debajo del juego, por encima del audio en espera */
 }
 
@@ -294,12 +350,16 @@ static void audio_thread(void *arg)
 {
     (void)arg;
     audio_stage = 1;
-    if (audsrv_init() != 0) {
-        printf("JARONA: audsrv_init fallo: %s\n", audsrv_get_error_string());
+    dbg_log("audsrv_init: llamando...");
+    int r = audsrv_init();
+    if (r != 0) {
+        dbg_log("audsrv_init ERR %d", r);
+        dbg_log("%s", audsrv_get_error_string());
         audio_failed = 1;
         ExitDeleteThread();
     }
     audio_stage = 2;
+    dbg_log("audsrv_init OK");
     audsrv_fmt_t fmt;
     fmt.bits = 16; fmt.freq = 44100; fmt.channels = 2;
     audsrv_set_format(&fmt);
@@ -313,8 +373,20 @@ static void audio_thread(void *arg)
     }
 }
 
+static volatile int audio_thread_started;
+
+/* 1 = el servidor de audsrv existe en el IOP, 0 = no, -1 = error al preguntar. Una sola consulta, no se queda esperando. */
+static int audsrv_bound(void)
+{
+    SifRpcClientData_t cd;
+    memset(&cd, 0, sizeof cd);
+    if (SifBindRpc(&cd, 0x870884, 0) < 0) return -1;     /* 0x870884 = AUDSRV_IRX */
+    return cd.server != 0;
+}
+
 static void audio_start(void)
 {
+    audio_thread_started = 1;
     start_thread(audio_thread, audio_stack, sizeof audio_stack, 0x60);
 }
 
@@ -378,15 +450,14 @@ static int load_irx(void *buf, unsigned size, const char *what)
 {
     int ret = 0;
     int id = SifExecModuleBuffer(buf, size, 0, NULL, &ret);
-    if (id < 0 || ret == 1) { printf("JARONA: no pude cargar %s (id=%d ret=%d)\n", what, id, ret); return -1; }
-    printf("JARONA: %s cargado (id=%d)\n", what, id);
-    return 1;
+    dbg_log("%s id=%d ret=%d", what, id, ret);
+    return (id < 0 || ret == 1) ? -1 : 1;
 }
 
 static int load_rom(const char *path)
 {
     int id = SifLoadModule(path, 0, NULL);
-    printf("JARONA: %s -> id=%d\n", path, id);
+    dbg_log("rom0 %s id=%d", path + 5, id);
     return id >= 0 ? 1 : -1;
 }
 
@@ -396,7 +467,6 @@ int main(int argc, char **argv)
     SifInitRpc(0);
     ChangeThreadPriority(GetThreadId(), 0x40);
 
-    printf("JARONA: build 5 (carga en hilo aparte, musica mu-law)\n");
     mixer_ensure_init();                                              /* antes de que exista ningun hilo de audio */
     gfx_init();
     stage(1, "graficos iniciados");
@@ -409,12 +479,12 @@ int main(int argc, char **argv)
     mod_state[7] = load_irx(padman_irx, size_padman_irx, "padman");
     pad_start();
     stage(2, "mando (arranca en segundo plano)");
+    dbg_log("build 6 - registro en pantalla");
 
     /* Audio: tambien en segundo plano; asi puede arrancar mientras se leen los datos del disco */
     mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd");
     mod_state[3] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv");
-    audio_start();
-    stage(3, "audio (arranca en segundo plano)");
+    stage(3, "modulos de audio cargados");
 
     int load_err = game_load();                                      /* solo texturas + 4 efectos (~1.5 MB); lo demas llega despues */
     if (load_err) printf("JARONA: game_load fallo (%d)\n", load_err);
@@ -423,7 +493,7 @@ int main(int argc, char **argv)
     const float frame_ms = (gs->Mode == GS_MODE_PAL) ? 20.0f : 16.6833f;
     double clock_ms = 0;
     u32 prev = 0;
-    int frames = 0, audio_retry = 0;
+    int frames = 0, audio_retry = 0, pad_logged = 0, audio_logged = 0, last_bound = -2;
     for (;;) {
         u32 cur = pad_read();
         u32 pressed = cur & ~prev, released = prev & ~cur;
@@ -438,18 +508,26 @@ int main(int argc, char **argv)
 
         /* Si el audio sigue sin responder, reintentos con otras combinaciones de modulos (se ven en los puntos) */
         frames++;
+        if (pad_ready && !pad_logged) { pad_logged = 1; dbg_log("mando OK (cuadro %d)", frames); }
+        if (audio_ready && !audio_logged) { audio_logged = 1; dbg_log("AUDIO OK (cuadro %d)", frames); }
+        if (!audio_thread_started && frames % 15 == 0) {
+            int b = audsrv_bound();
+            if (b != last_bound) { last_bound = b; dbg_log("servidor audsrv: %s", b > 0 ? "EXISTE" : (b == 0 ? "NO existe" : "ERROR")); }
+            if (b > 0) audio_start();
+            else if (frames >= 600) { dbg_log("llamo a audsrv_init igualmente"); audio_start(); }
+        }
         if (!audio_ready && audio_retry == 0 && frames == 150) {
             audio_retry = 1;
-            printf("JARONA: el audio no responde: 2o intento con rom0:LIBSD\n");
+            dbg_log("2o intento: rom0 LIBSD");
             mod_state[4] = load_rom("rom0:LIBSD");
             mod_state[5] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv (2o intento)");
-            if (audio_failed) { audio_failed = 0; audio_start(); }
+            if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
         } else if (!audio_ready && audio_retry == 1 && frames == 400) {
             audio_retry = 2;
-            printf("JARONA: el audio sigue sin responder: 3er intento recargando libsd y audsrv incrustados\n");
+            dbg_log("3er intento: libsd+audsrv");
             mod_state[8] = load_irx(libsd_irx, size_libsd_irx, "libsd (3er intento)");
             mod_state[9] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv (3er intento)");
-            if (audio_failed) { audio_failed = 0; audio_start(); }
+            if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
         }
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */
         clock_ms += frame_ms;

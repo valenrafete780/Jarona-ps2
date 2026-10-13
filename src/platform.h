@@ -20,6 +20,9 @@ void gfx_end(void);                                         /* presenta el fotog
 void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t done, uint32_t total));
 
 
+/* Mensaje de diagnostico (en la PS2 sale en el registro en pantalla) */
+void plat_log(const char *msg);
+
 /* Carga en SEGUNDO PLANO: un hilo aparte lee los ficheros en orden mientras el juego sigue a su ritmo.
  * (En el emulador el disco lee a ~250 KB/s: leer en el hilo principal congelaba la animacion.) */
 void plat_async_begin(const char *const *names, int n);                 /* empieza a cargar names[0..n-1] en orden */
