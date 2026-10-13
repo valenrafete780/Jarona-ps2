@@ -4,7 +4,7 @@
 set -e
 ELF="${1:-JARONA.ELF}"; ISO="${2:-JARONA.ISO}"; REGION="${3:-NTSC}"
 [ -f "$ELF" ] || { echo "No existe $ELF (compila primero con make)"; exit 1; }
-FILES="TEX.DAT TREE.DAT JARONA.PCM ULTIMO.PCM PODER.PCM OMEGA.PCM SECRETO.ULW MUSICA.ULW"
+FILES="TEX.DAT SFX.DAT TREE.DAT SECRETO.ULW MUSICA.ULW"
 for f in $FILES; do
   [ -f "data/$f" ] || { echo "Falta data/$f: ejecuta antes  python3 tools/convert_assets.py ../jarona"; exit 1; }
 done

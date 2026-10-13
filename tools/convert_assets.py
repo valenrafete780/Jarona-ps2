@@ -4,7 +4,7 @@ Convierte jarona/index.html + jarona/audio/*.mp3 en los datos que lee la version
 
   data/TEX.DAT     texturas (RGBA8, sin relleno) con una tabla de nombres
   data/TREE.DAT    escena secreta (gif) en 8 bits con paleta: se carga en segundo plano
-  data/*.PCM       efectos: s16le, mono, 22050 Hz
+  data/SFX.DAT     los 4 efectos juntos (s16le, mono, 22050 Hz): cada fichero extra cuesta una latencia fija de disco
   data/*.ULW       musica y pista secreta: mu-law de 8 bits, mono, 22050 Hz (la mitad de tamano, ~37 dB SNR)
 
 Uso:  python3 tools/convert_assets.py ../jarona  [--font /ruta/fuente.ttf]
@@ -162,3 +162,14 @@ for name, fmt, ext in (("jarona", "s16le", "PCM"), ("ultimo", "s16le", "PCM"), (
     subprocess.check_call(["ffmpeg", "-y", "-v", "error", "-i", src, "-ac", "1", "-ar", "22050", "-f", fmt, dst])
     bps = 2 if fmt == "s16le" else 1
     print("%s: %.1f s, %.2f MB" % (os.path.basename(dst), os.path.getsize(dst) / bps / 22050, os.path.getsize(dst) / 1048576))
+
+# SFX.DAT: "JSFX" + 4 tamanos (jarona, ultimo, poder, omega) + datos; se borran los .PCM sueltos
+names = ("JARONA", "ULTIMO", "PODER", "OMEGA")
+blobs = [open(os.path.join(args.out, n + ".PCM"), "rb").read() for n in names]
+with open(os.path.join(args.out, "SFX.DAT"), "wb") as f:
+    f.write(b"JSFX" + struct.pack("<4I", *[len(b) for b in blobs]))
+    for b in blobs:
+        f.write(b)
+for n in names:
+    os.remove(os.path.join(args.out, n + ".PCM"))
+print("SFX.DAT: %.2f MB" % (os.path.getsize(os.path.join(args.out, "SFX.DAT")) / 1048576))
