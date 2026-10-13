@@ -19,4 +19,11 @@ void gfx_end(void);                                         /* presenta el fotog
 /* Lee un fichero entero (malloc). progress(leidos,total) opcional. NULL si no existe. */
 void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t done, uint32_t total));
 
+
+/* Lectura por trozos (para cargar la musica en segundo plano mientras ya se ve el juego) */
+typedef struct PlatFile PlatFile;
+PlatFile *plat_open(const char *name, uint32_t *size);          /* NULL si no existe */
+uint32_t  plat_read(PlatFile *f, void *dst, uint32_t n);        /* bytes leidos (0 = fin o error) */
+void      plat_close(PlatFile *f);
+
 #endif

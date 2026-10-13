@@ -165,10 +165,44 @@ static int mk(const char *name, Tex *t, int smooth)
 
 static void draw_bar_screen(int show_title, float frac);
 
+/* ---- carga en segundo plano: la musica (8.5 MB) y la pista secreta (2.6 MB) se leen a trozos, un poco por
+ *      fotograma, mientras ya se ve el juego. Asi se arranca en ~1/3 del tiempo y la animacion no se para. ---- */
+#define BG_CHUNK 49152
+static const char *BG_FILES[2] = { "MUSICA.PCM", "SECRETO.PCM" };
+static struct { PlatFile *f; uint8_t *buf; uint32_t size, done; int idx; } bg;
+static int music_wanted, music_loaded;
+
+static void bg_finish(int ok)
+{
+    plat_close(bg.f);
+    if (ok) {
+        if (bg.idx == 0) { mixer_set_music((int16_t *)bg.buf, bg.size / 2); music_loaded = 1; if (music_wanted) mixer_music_start(); }
+        else mixer_set_secret((int16_t *)bg.buf, bg.size / 2);
+    } else free(bg.buf);
+    bg.f = NULL; bg.buf = NULL; bg.idx++;
+}
+
+static void bg_step(void)
+{
+    if (bg.idx >= 2) return;
+    if (!bg.f) {
+        uint32_t sz = 0;
+        bg.f = plat_open(BG_FILES[bg.idx], &sz);
+        if (!bg.f) { fprintf(stderr, "falta %s\n", BG_FILES[bg.idx]); bg.idx++; return; }
+        bg.buf = (uint8_t *)malloc(sz + 16);
+        if (!bg.buf) { plat_close(bg.f); bg.f = NULL; bg.idx++; return; }
+        bg.size = sz; bg.done = 0;
+    }
+    uint32_t n = bg.size - bg.done; if (n > BG_CHUNK) n = BG_CHUNK;
+    uint32_t r = plat_read(bg.f, bg.buf + bg.done, n);
+    bg.done += r;
+    if (bg.done >= bg.size) bg_finish(1);
+    else if (r == 0) bg_finish(0);
+}
+
 typedef struct { const char *name; float weight; } Item;
 static const Item ITEMS[] = {
-    { "TEX.DAT", 3.7f }, { "JARONA.PCM", 0.06f }, { "ULTIMO.PCM", 0.15f }, { "PODER.PCM", 0.2f },
-    { "OMEGA.PCM", 0.2f }, { "SECRETO.PCM", 2.6f }, { "MUSICA.PCM", 8.5f },
+    { "TEX.DAT", 3.7f }, { "JARONA.PCM", 0.06f }, { "ULTIMO.PCM", 0.15f }, { "PODER.PCM", 0.2f }, { "OMEGA.PCM", 0.2f },
 };
 #define N_ITEMS ((int)(sizeof ITEMS / sizeof ITEMS[0]))
 static float item_base, item_weight, total_weight;
@@ -245,8 +279,6 @@ int game_load(void)
         if (!pcm) { fprintf(stderr, "falta %s\n", ITEMS[i].name); gstate = G_ERROR; return -1; }
         for (unsigned k = 0; k < sizeof sfxs / sizeof sfxs[0]; k++)
             if (strcmp(ITEMS[i].name, sfxs[k].f) == 0) mixer_set_sfx(sfxs[k].id, pcm, n / 2);
-        if (strcmp(ITEMS[i].name, "SECRETO.PCM") == 0) mixer_set_secret(pcm, n / 2);
-        if (strcmp(ITEMS[i].name, "MUSICA.PCM") == 0) mixer_set_music(pcm, n / 2);
         item_base += ITEMS[i].weight;
         draw_bar_screen(1, item_base / total_weight);
     }
@@ -656,12 +688,14 @@ void game_frame(uint32_t now_ms, const GameInput *in)
 {
     g_prev = g_now; g_now = (int32_t)now_ms;
     if (SW == 0) { SW = gfx_width(); SH = gfx_height(); }
+    if (gstate == G_START || gstate == G_PLAY) bg_step();
     switch (gstate) {
     case G_START:
         draw_start_screen();
         if (in->start_down || in->tap_down) {
             gstate = G_PLAY;
-            mixer_music_start();                                   /* la musica empieza aqui y ya no se detiene */
+            music_wanted = 1;
+            if (music_loaded) mixer_music_start();                 /* la musica empieza aqui y ya no se detiene */
             omega_next = g_now + OM_MS;
             g_prev = g_now;
         }
