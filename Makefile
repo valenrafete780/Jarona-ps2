@@ -10,16 +10,16 @@ EE_BIN     = JARONA.ELF
 EE_BIN_PKD = JARONA-packed.ELF
 
 EE_OBJS = main_ps2.o game.o mixer.o \
-          sio2man_irx.o padman_irx.o libsd_irx.o audsrv_irx.o
+          libsd_irx.o audsrv_irx.o
 
 EE_CFLAGS += -O2 -Wall -Wno-unused-function
 EE_INCS   += -Isrc -I$(PS2DEV)/gsKit/include -I$(PS2SDK)/ports/include
 EE_LDFLAGS += -L$(PS2DEV)/gsKit/lib -L$(PS2SDK)/ports/lib
-EE_LIBS   += -lgskit -ldmakit -laudsrv -lpad -lm
+EE_LIBS   += -lgskit -ldmakit -laudsrv -lpad -lpatches -lm
 
 vpath %.c src
 
-# Los modulos del IOP (sio2man, padman, libsd, audsrv) se incrustan en el ELF
+# Los modulos del IOP (libsd, audsrv) se incrustan en el ELF; el mando usa los de la BIOS (rom0:)
 %_irx.c: $(PS2SDK)/iop/irx/%.irx
 	$(PS2SDK)/bin/bin2c $< $@ $*_irx
 
