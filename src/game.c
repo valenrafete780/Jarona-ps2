@@ -65,8 +65,11 @@ static Tex t_flowery, t_pose, t_power, t_char[N_CHARS], t_omega, t_tree, t_floor
 static const uint8_t *pw_frames[N_POWER], *om_frames[OM_COUNT];   /* fotogramas en RAM; en VRAM solo el visible */
 static int pw_cur = -1, om_cur = -1;
 static Tex t_title, t_loading, t_hint, t_start, t_start_p, t_btnA, t_btnA_p, t_btnB, t_btnB_p;
-static const uint8_t *tree_frames[MAX_TREE];
-static int tree_count, tree_cur = -1;
+/* escena secreta (TREE.DAT): fotogramas de 8 bits + paleta; se expande a RGBA solo el fotograma visible */
+static const uint8_t *tree_idx[MAX_TREE];
+static uint8_t tree_pal[256 * 4];
+static uint8_t *tree_rgba;
+static int tree_count, tree_cur = -1, tree_w, tree_h;
 static int32_t tree_ms[MAX_TREE];
 
 /* visibilidad de capas (equivale a los atributos hidden de la pagina) */
@@ -165,39 +168,26 @@ static int mk(const char *name, Tex *t, int smooth)
 
 static void draw_bar_screen(int show_title, float frac);
 
-/* ---- carga en segundo plano: la musica (8.5 MB) y la pista secreta (2.6 MB) se leen a trozos, un poco por
- *      fotograma, mientras ya se ve el juego. Asi se arranca en ~1/3 del tiempo y la animacion no se para. ---- */
-#define BG_CHUNK 49152
-static const char *BG_FILES[2] = { "MUSICA.PCM", "SECRETO.PCM" };
-static struct { PlatFile *f; uint8_t *buf; uint32_t size, done; int idx; } bg;
-static int music_wanted, music_loaded;
+/* ---- carga en segundo plano (hilo aparte): musica (4 MB), pista secreta (1.3 MB) y arbol secreto (0.7 MB) ---- */
+static const char *const BG_FILES[3] = { "MUSICA.ULW", "SECRETO.ULW", "TREE.DAT" };
+static int bg_done[3];
+static int music_wanted, music_loaded, tree_ready;
 
-static void bg_finish(int ok)
-{
-    plat_close(bg.f);
-    if (ok) {
-        if (bg.idx == 0) { mixer_set_music((int16_t *)bg.buf, bg.size / 2); music_loaded = 1; if (music_wanted) mixer_music_start(); }
-        else mixer_set_secret((int16_t *)bg.buf, bg.size / 2);
-    } else free(bg.buf);
-    bg.f = NULL; bg.buf = NULL; bg.idx++;
-}
+static void tree_init(const uint8_t *d, uint32_t size);
 
-static void bg_step(void)
+static void bg_poll(void)
 {
-    if (bg.idx >= 2) return;
-    if (!bg.f) {
-        uint32_t sz = 0;
-        bg.f = plat_open(BG_FILES[bg.idx], &sz);
-        if (!bg.f) { fprintf(stderr, "falta %s\n", BG_FILES[bg.idx]); bg.idx++; return; }
-        bg.buf = (uint8_t *)malloc(sz + 16);
-        if (!bg.buf) { plat_close(bg.f); bg.f = NULL; bg.idx++; return; }
-        bg.size = sz; bg.done = 0;
+    for (int i = 0; i < 3; i++) {
+        if (bg_done[i]) continue;
+        void *data = NULL; uint32_t size = 0;
+        int r = plat_async_poll(i, &data, &size);
+        if (r == 0) break;                                   /* se cargan en orden: si esta no esta, las siguientes tampoco */
+        bg_done[i] = 1;
+        if (r < 0 || !data) { fprintf(stderr, "fallo al cargar %s\n", BG_FILES[i]); continue; }
+        if (i == 0) { mixer_set_music((const uint8_t *)data, size); music_loaded = 1; if (music_wanted) mixer_music_start(); }
+        else if (i == 1) mixer_set_secret((const uint8_t *)data, size);
+        else tree_init((const uint8_t *)data, size);
     }
-    uint32_t n = bg.size - bg.done; if (n > BG_CHUNK) n = BG_CHUNK;
-    uint32_t r = plat_read(bg.f, bg.buf + bg.done, n);
-    bg.done += r;
-    if (bg.done >= bg.size) bg_finish(1);
-    else if (r == 0) bg_finish(0);
 }
 
 typedef struct { const char *name; float weight; } Item;
@@ -257,22 +247,13 @@ int game_load(void)
     bad |= mk("power0", &t_power, 0); pw_cur = 0;
     bad |= mk("om00", &t_omega, 0);   om_cur = 0;
     for (int i = 0; i < N_CHARS; i++) { snprintf(nm, sizeof nm, "char%d", i); bad |= mk(nm, &t_char[i], i == 5); }
-    /* escena secreta: UNA textura que se re-sube en cada fotograma del gif (ahorra VRAM) */
-    for (tree_count = 0; tree_count < MAX_TREE; tree_count++) {
-        snprintf(nm, sizeof nm, "tree%02d", tree_count);
-        const Entry *e = find_entry(nm);
-        if (!e) break;
-        tree_frames[tree_count] = texdat + e->off;
-        tree_ms[tree_count] = (tree_count == 6) ? 240 : 120;   /* duraciones del gif original */
-    }
-    if (tree_count == 0) bad = -1; else bad |= mk("tree00", &t_tree, 0);
     if (bad) { gstate = G_ERROR; return -1; }
 
     /* 2) audio: efectos y musica por separado, listos para mezclarse */
     cur_show_title = 1;
     static const struct { const char *f; int id; } sfxs[] = {
         { "JARONA.PCM", SFX_JARONA }, { "ULTIMO.PCM", SFX_ULTIMO }, { "PODER.PCM", SFX_PODER }, { "OMEGA.PCM", SFX_OMEGA } };
-    mixer_init();
+    mixer_ensure_init();
     for (int i = 1; i < N_ITEMS; i++) {
         uint32_t n = 0;
         int16_t *pcm = (int16_t *)load_item(i, &n);
@@ -283,8 +264,45 @@ int game_load(void)
         draw_bar_screen(1, item_base / total_weight);
     }
     draw_bar_screen(1, 1.0f);
+    plat_async_begin(BG_FILES, 3);                           /* la musica y el arbol llegan mientras ya se ve el juego */
     gstate = G_START;
     return 0;
+}
+
+static void tree_expand(int f)
+{
+    const uint8_t *s = tree_idx[f];
+    int n = tree_w * tree_h;
+    for (int i = 0; i < n; i++) memcpy(tree_rgba + (size_t)i * 4, tree_pal + (size_t)s[i] * 4, 4);
+    gfx_tex_update(t_tree.id, tree_rgba);
+    tree_cur = f;
+}
+
+static void tree_init(const uint8_t *d, uint32_t size)
+{
+    uint32_t hdr[4];
+    if (size < 20 || memcmp(d, "JTRE", 4) != 0) return;
+    memcpy(hdr, d + 4, 16);
+    uint32_t count = hdr[0], w = hdr[1], h = hdr[2], ncol = hdr[3];
+    if (count == 0 || count > MAX_TREE || ncol > 256 || w == 0 || h == 0) return;
+    uint32_t off = 20;
+    if (size < off + count * 4 + ncol * 4 + count * w * h) return;
+    for (uint32_t i = 0; i < count; i++) { uint32_t ms; memcpy(&ms, d + off + i * 4, 4); tree_ms[i] = (int32_t)ms; }
+    off += count * 4;
+    memset(tree_pal, 0, sizeof tree_pal);
+    memcpy(tree_pal, d + off, ncol * 4);
+    off += ncol * 4;
+    for (uint32_t i = 0; i < count; i++) tree_idx[i] = d + off + (size_t)i * w * h;
+    tree_w = (int)w; tree_h = (int)h; tree_count = (int)count;
+    tree_rgba = (uint8_t *)malloc((size_t)w * h * 4);
+    if (!tree_rgba) return;
+    /* textura con el primer fotograma; luego se re-sube el que toque */
+    for (uint32_t i = 0; i < w * h; i++) memcpy(tree_rgba + (size_t)i * 4, tree_pal + (size_t)tree_idx[0][i] * 4, 4);
+    t_tree.w = tree_w; t_tree.h = tree_h;
+    t_tree.id = gfx_tex_create(tree_w, tree_h, tree_rgba, 0);
+    if (t_tree.id < 0) return;
+    tree_cur = 0;
+    tree_ready = 1;
 }
 
 /* ---------------- dibujo: utilidades ---------------- */
@@ -440,7 +458,7 @@ static void slide_done(void)
 
 static void open_secret(void)
 {
-    if (secret_on || !mixer_has_secret()) return;
+    if (secret_on || !mixer_has_secret() || !tree_ready) return;
     secret_on = 1;                                   /* no hay salida: solo reiniciando la consola */
     mixer_enter_secret();                            /* calla musica y efectos, suena "secreto" en bucle */
     secret_t0 = g_now;
@@ -663,7 +681,7 @@ static void draw_scene(void)
         int32_t total_ms = 0; for (int i = 0; i < tree_count; i++) total_ms += tree_ms[i];
         int32_t m = (g_now - secret_t0) % total_ms, f = 0;
         while (f < tree_count - 1 && m >= tree_ms[f]) { m -= tree_ms[f]; f++; }
-        if (f != tree_cur) { gfx_tex_update(t_tree.id, tree_frames[f]); tree_cur = f; }
+        if (f != tree_cur) tree_expand(f);
         float s = 560.0f / t_tree.w; float sh = ((float)SH - 8) / t_tree.h; if (sh < s) s = sh;
         s = floorf(s * 2) / 2;                                      /* escala en pasos de 0.5: pixeles nitidos */
         draw_tex_scaled(&t_tree, SW / 2.0f, SH / 2.0f, s, a);
@@ -688,7 +706,7 @@ void game_frame(uint32_t now_ms, const GameInput *in)
 {
     g_prev = g_now; g_now = (int32_t)now_ms;
     if (SW == 0) { SW = gfx_width(); SH = gfx_height(); }
-    if (gstate == G_START || gstate == G_PLAY) bg_step();
+    if (gstate == G_START || gstate == G_PLAY) bg_poll();
     switch (gstate) {
     case G_START:
         draw_start_screen();

@@ -14,8 +14,23 @@ typedef struct {
 } Voice;
 
 typedef struct { const int16_t *d; uint32_t n; } Clip;
+typedef struct { const uint8_t *d; uint32_t n; } Clip8;     /* mu-law */
 
-static Clip sfx[SFX_COUNT], music, secret;
+static Clip sfx[SFX_COUNT];
+static Clip8 music, secret;
+static int16_t ulaw_tab[256];
+static int ulaw_ready, mixer_started;
+
+static void build_ulaw(void)
+{
+    for (int i = 0; i < 256; i++) {                          /* G.711 mu-law -> PCM de 16 bits */
+        int u = ~i & 0xFF;
+        int t = ((u & 0x0F) << 3) + 0x84;
+        t <<= (u & 0x70) >> 4;
+        ulaw_tab[i] = (int16_t)((u & 0x80) ? (0x84 - t) : (t - 0x84));
+    }
+    ulaw_ready = 1;
+}
 static Voice voices[MIX_VOICES];
 static uint32_t next_steal;
 
@@ -31,6 +46,8 @@ static inline void barrier(void) { __sync_synchronize(); }
 
 void mixer_init(void)
 {
+    mixer_started = 1;
+    if (!ulaw_ready) build_ulaw();
     memset(sfx, 0, sizeof sfx);
     memset(voices, 0, sizeof voices);
     memset(&music, 0, sizeof music);
@@ -42,9 +59,11 @@ void mixer_init(void)
     sgain = 1.0f; last_s = 0; rendered = 0; next_steal = 0;
 }
 
+void mixer_ensure_init(void) { if (!mixer_started) mixer_init(); }
+
 void mixer_set_sfx(int id, const int16_t *pcm, uint32_t n) { sfx[id].d = pcm; sfx[id].n = n; }
-void mixer_set_music(const int16_t *pcm, uint32_t n)       { music.d = pcm; music.n = n; }
-void mixer_set_secret(const int16_t *pcm, uint32_t n)      { secret.d = pcm; secret.n = n; }
+void mixer_set_music(const uint8_t *u, uint32_t n)         { music.n = 0; music.d = u; music.n = n; }
+void mixer_set_secret(const uint8_t *u, uint32_t n)        { secret.n = 0; secret.d = u; secret.n = n; }
 
 static void ramp_music(float to, float secs)
 {
@@ -108,7 +127,7 @@ static inline int16_t mix_one(void)
     fxgain = approach(fxgain, fxtarget, fxstep);
 
     if (music_on) {
-        s += (float)music.d[music_pos] * mgain;       /* la musica avanza SIEMPRE: nunca se pausa */
+        s += (float)ulaw_tab[music.d[music_pos]] * mgain;       /* la musica avanza SIEMPRE: nunca se pausa */
         if (++music_pos >= music.n) music_pos = 0;    /* bucle sin cortes */
     }
     for (int i = 0; i < MIX_VOICES; i++) {
@@ -120,7 +139,7 @@ static inline int16_t mix_one(void)
         v->pos = p + 1;
     }
     if (secret_on) {
-        s += (float)secret.d[secret_pos] * sgain;
+        s += (float)ulaw_tab[secret.d[secret_pos]] * sgain;
         if (++secret_pos >= secret.n) secret_pos = 0;
     }
     if (s > 32767.0f) s = 32767.0f;

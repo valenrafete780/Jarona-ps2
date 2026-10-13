@@ -14,10 +14,12 @@
 
 enum { SFX_JARONA, SFX_ULTIMO, SFX_PODER, SFX_OMEGA, SFX_COUNT };
 
-void     mixer_init(void);
+void     mixer_init(void);              /* reinicia todo */
+void     mixer_ensure_init(void);       /* solo si aun no se inicio (lo llaman main_ps2 y game_load) */
 void     mixer_set_sfx(int id, const int16_t *pcm, uint32_t samples);
-void     mixer_set_music(const int16_t *pcm, uint32_t samples);
-void     mixer_set_secret(const int16_t *pcm, uint32_t samples);
+/* Musica y pista secreta vienen en mu-law de 8 bits (la mitad de datos que cargar): 'samples' = numero de bytes */
+void     mixer_set_music(const uint8_t *ulaw, uint32_t samples);
+void     mixer_set_secret(const uint8_t *ulaw, uint32_t samples);
 
 void     mixer_music_start(void);       /* empieza la musica en bucle (fundido de entrada 1.5 s) */
 void     mixer_play_sfx(int id);        /* suena encima de la musica, sin tocarla */

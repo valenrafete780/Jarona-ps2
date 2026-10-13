@@ -79,24 +79,13 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
     return buf;
 }
 
-PlatFile *plat_open(const char *name, uint32_t *size)
-{
-    FILE *f = open_data(name);
-    if (!f) { printf("JARONA: no encuentro %s\n", name); return NULL; }
-    fseek(f, 0, SEEK_END);
-    *size = (uint32_t)ftell(f);
-    fseek(f, 0, SEEK_SET);
-    return (PlatFile *)f;
-}
-uint32_t plat_read(PlatFile *f, void *dst, uint32_t n) { return (uint32_t)fread(dst, 1, n, (FILE *)f); }
-void plat_close(PlatFile *f) { if (f) fclose((FILE *)f); }
-
 /* =============================== graficos =============================== */
 #define MAX_TEX 160
 
 typedef struct { GSTEXTURE t; int w, h; u32 *mem; } PTex;
 static volatile int pad_ready, audio_ready, audio_failed;   /* los ponen los hilos de inicio */
-static int mod_state[8];                      /* modulos IOP: 0 sin intentar, 1 cargado, -1 fallo */
+static volatile int audio_stage;              /* 0 hilo sin arrancar, 1 esperando a audsrv_init, 2 init hecho */
+static int mod_state[10];                     /* modulos IOP: 0 sin intentar, 1 cargado, -1 fallo */
 static GSGLOBAL *gs;
 static PTex ptex[MAX_TEX];
 static int  nptex;
@@ -205,22 +194,24 @@ void gfx_quad(int id, const float c[8], float alpha)
                             2, col(0x80, 0x80, 0x80, alpha));
 }
 
-static u64 dot(int s)
+static u64 dot(int s)      /* 1 verde, 0 amarillo (esperando), -1 rojo, 9 gris (sin intentar) */
 {
-    if (s > 0 && s != 2) return GS_SETREG_RGBAQ(0, 200, 0, 0x80, 0);      /* verde */
-    if (s < 0) return GS_SETREG_RGBAQ(255, 0, 0, 0x80, 0);                /* rojo */
-    if (s == 2) return GS_SETREG_RGBAQ(90, 90, 90, 0x80, 0);              /* gris: sin intentar */
-    return GS_SETREG_RGBAQ(230, 200, 0, 0x80, 0);                         /* amarillo: esperando */
+    if (s == 1) return GS_SETREG_RGBAQ(0, 200, 0, 0x80, 0);
+    if (s < 0) return GS_SETREG_RGBAQ(255, 0, 0, 0x80, 0);
+    if (s == 9) return GS_SETREG_RGBAQ(90, 90, 90, 0x80, 0);
+    return GS_SETREG_RGBAQ(230, 200, 0, 0x80, 0);
 }
 
 void gfx_end(void)
 {
 #ifndef NO_DEBUG_DOTS
-    /* Fila 1: mando y audio (verde = listo, amarillo = esperando, rojo = fallo).
-     * Fila 2: modulos del IOP: SIO2MAN, PADMAN (BIOS), libsd, audsrv, libsd(BIOS), audsrv(2o intento), sio2man, padman (incrustados). */
+    /* Fila 1: mando | audio | etapa de audsrv_init (gris = hilo sin arrancar, amarillo = esperando, verde = hecho).
+     * Fila 2: modulos IOP: SIO2MAN y PADMAN (BIOS), libsd, audsrv, libsd (BIOS, 2o intento), audsrv (2o), sio2man y padman
+     *         incrustados, libsd y audsrv (3er intento). Gris = sin intentar, verde = cargado, rojo = fallo. */
     gsKit_prim_sprite(gs, 4, 4, 14, 14, 3, dot(pad_ready ? 1 : 0));
     gsKit_prim_sprite(gs, 18, 4, 28, 14, 3, dot(audio_ready ? 1 : (audio_failed ? -1 : 0)));
-    for (int i = 0; i < 8; i++) gsKit_prim_sprite(gs, 4.0f + i * 10, 18, 11.0f + i * 10, 25, 3, dot(mod_state[i] ? mod_state[i] : 2));
+    gsKit_prim_sprite(gs, 32, 4, 42, 14, 3, dot(audio_stage == 0 ? 9 : (audio_stage == 1 ? 0 : 1)));
+    for (int i = 0; i < 10; i++) gsKit_prim_sprite(gs, 4.0f + i * 10, 18, 11.0f + i * 10, 25, 3, dot(mod_state[i] ? mod_state[i] : 9));
 #endif
     gsKit_queue_exec(gs);
     gsKit_sync_flip(gs);
@@ -243,6 +234,57 @@ static void start_thread(void (*fn)(void *), void *stack, int size, int prio)
     StartThread(id, NULL);
 }
 
+/* =============================== carga en segundo plano =============================== */
+typedef struct { void *data; uint32_t size; volatile int state; } ARes;      /* state: 0 pendiente, 1 listo, -1 fallo */
+static ARes ares[8];
+static const char *const *a_names;
+static int a_n;
+static u8 loader_stack[16 * 1024] __attribute__((aligned(16)));
+
+static void loader_thread(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < a_n; i++) {
+        FILE *f = open_data(a_names[i]);
+        if (!f) { printf("JARONA: no encuentro %s\n", a_names[i]); ares[i].state = -1; continue; }
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        uint8_t *buf = (uint8_t *)malloc((size_t)n + 16);
+        long done = 0;
+        if (buf) {
+            while (done < n) {                                        /* este hilo se duerme esperando al disco; el juego no */
+                long k = n - done > 65536 ? 65536 : n - done;
+                long r = (long)fread(buf + done, 1, (size_t)k, f);
+                if (r <= 0) break;
+                done += r;
+            }
+        }
+        fclose(f);
+        if (!buf || done != n) { free(buf); printf("JARONA: lectura incompleta de %s\n", a_names[i]); ares[i].state = -1; continue; }
+        ares[i].data = buf; ares[i].size = (uint32_t)n;
+        __sync_synchronize();
+        ares[i].state = 1;
+        printf("JARONA: %s cargado en segundo plano (%ld bytes)\n", a_names[i], n);
+    }
+    ExitDeleteThread();
+}
+
+void plat_async_begin(const char *const *names, int n)
+{
+    a_names = names;
+    a_n = n < 8 ? n : 8;
+    start_thread(loader_thread, loader_stack, sizeof loader_stack, 0x58);   /* por debajo del juego, por encima del audio en espera */
+}
+
+int plat_async_poll(int i, void **data, uint32_t *size)
+{
+    if (i < 0 || i >= a_n) return -1;
+    int st = ares[i].state;
+    if (st == 1) { *data = ares[i].data; *size = ares[i].size; }
+    return st;
+}
+
 /* =============================== audio =============================== */
 #define AUDIO_FRAMES 1024                      /* 1024 tramas a 44.1 kHz = 23 ms por bloque */
 static u8 audio_stack[32 * 1024] __attribute__((aligned(16)));
@@ -251,11 +293,13 @@ static int16_t audio_buf[AUDIO_FRAMES * 2] __attribute__((aligned(64)));
 static void audio_thread(void *arg)
 {
     (void)arg;
+    audio_stage = 1;
     if (audsrv_init() != 0) {
         printf("JARONA: audsrv_init fallo: %s\n", audsrv_get_error_string());
         audio_failed = 1;
         ExitDeleteThread();
     }
+    audio_stage = 2;
     audsrv_fmt_t fmt;
     fmt.bits = 16; fmt.freq = 44100; fmt.channels = 2;
     audsrv_set_format(&fmt);
@@ -352,32 +396,28 @@ int main(int argc, char **argv)
     SifInitRpc(0);
     ChangeThreadPriority(GetThreadId(), 0x40);
 
-    printf("JARONA: build 4 (fondo limpio, carga en segundo plano)\n");
+    printf("JARONA: build 5 (carga en hilo aparte, musica mu-law)\n");
+    mixer_ensure_init();                                              /* antes de que exista ningun hilo de audio */
     gfx_init();
     stage(1, "graficos iniciados");
 
-    /* Mando: primero los modulos de la BIOS (lo habitual con libpad); si no responden, los incrustados */
+    /* Mando: en tu emulador hacen falta los modulos de la BIOS Y los incrustados. Se cargan seguidos y NO se espera:
+     * el hilo del mando se despierta solo cuando padman responde, mientras el juego carga. */
     mod_state[0] = load_rom("rom0:SIO2MAN");
     mod_state[1] = load_rom("rom0:PADMAN");
+    mod_state[6] = load_irx(sio2man_irx, size_sio2man_irx, "sio2man");
+    mod_state[7] = load_irx(padman_irx, size_padman_irx, "padman");
     pad_start();
-    for (int i = 0; i < 90 && !pad_ready; i++) stage_wait(1);
-    if (!pad_ready) {
-        printf("JARONA: el mando no responde con los modulos de la BIOS: pruebo los incrustados\n");
-        mod_state[6] = load_irx(sio2man_irx, size_sio2man_irx, "sio2man");
-        mod_state[7] = load_irx(padman_irx, size_padman_irx, "padman");
-        for (int i = 0; i < 120 && !pad_ready; i++) stage_wait(1);
-    }
-    printf("JARONA: mando %s\n", pad_ready ? "OK" : "NO responde (el juego arranca igualmente)");
-    stage(2, "mando");
+    stage(2, "mando (arranca en segundo plano)");
 
-    /* Audio */
+    /* Audio: tambien en segundo plano; asi puede arrancar mientras se leen los datos del disco */
     mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd");
     mod_state[3] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv");
-    stage(3, "modulos de audio");
+    audio_start();
+    stage(3, "audio (arranca en segundo plano)");
 
-    int load_err = game_load();                                      /* solo texturas + 4 efectos: la musica llega despues */
+    int load_err = game_load();                                      /* solo texturas + 4 efectos (~1.5 MB); lo demas llega despues */
     if (load_err) printf("JARONA: game_load fallo (%d)\n", load_err);
-    else audio_start();                                              /* en un hilo: si audsrv no responde, el juego sigue sin sonido */
 
     /* El tiempo del juego avanza por fotogramas (vsync): 59.94 Hz en NTSC, 50 Hz en PAL */
     const float frame_ms = (gs->Mode == GS_MODE_PAL) ? 20.0f : 16.6833f;
@@ -396,12 +436,19 @@ int main(int argc, char **argv)
         in.start_down = (pressed  & PAD_START) != 0;
         prev = cur;
 
-        /* Si a los ~5 s el audio sigue sin responder: segundo intento con libsd de la BIOS y recargando audsrv */
-        if (!audio_ready && !audio_retry && ++frames == 250) {
+        /* Si el audio sigue sin responder, reintentos con otras combinaciones de modulos (se ven en los puntos) */
+        frames++;
+        if (!audio_ready && audio_retry == 0 && frames == 150) {
             audio_retry = 1;
-            printf("JARONA: el audio no responde: segundo intento con rom0:LIBSD\n");
+            printf("JARONA: el audio no responde: 2o intento con rom0:LIBSD\n");
             mod_state[4] = load_rom("rom0:LIBSD");
             mod_state[5] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv (2o intento)");
+            if (audio_failed) { audio_failed = 0; audio_start(); }
+        } else if (!audio_ready && audio_retry == 1 && frames == 400) {
+            audio_retry = 2;
+            printf("JARONA: el audio sigue sin responder: 3er intento recargando libsd y audsrv incrustados\n");
+            mod_state[8] = load_irx(libsd_irx, size_libsd_irx, "libsd (3er intento)");
+            mod_state[9] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv (3er intento)");
             if (audio_failed) { audio_failed = 0; audio_start(); }
         }
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */

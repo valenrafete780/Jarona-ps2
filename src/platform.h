@@ -20,10 +20,9 @@ void gfx_end(void);                                         /* presenta el fotog
 void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t done, uint32_t total));
 
 
-/* Lectura por trozos (para cargar la musica en segundo plano mientras ya se ve el juego) */
-typedef struct PlatFile PlatFile;
-PlatFile *plat_open(const char *name, uint32_t *size);          /* NULL si no existe */
-uint32_t  plat_read(PlatFile *f, void *dst, uint32_t n);        /* bytes leidos (0 = fin o error) */
-void      plat_close(PlatFile *f);
+/* Carga en SEGUNDO PLANO: un hilo aparte lee los ficheros en orden mientras el juego sigue a su ritmo.
+ * (En el emulador el disco lee a ~250 KB/s: leer en el hilo principal congelaba la animacion.) */
+void plat_async_begin(const char *const *names, int n);                 /* empieza a cargar names[0..n-1] en orden */
+int  plat_async_poll(int i, void **data, uint32_t *size);               /* 0 = aun no, 1 = listo (data/size), -1 = fallo */
 
 #endif
