@@ -83,6 +83,7 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
 #define MAX_TEX 160
 
 typedef struct { GSTEXTURE t; int w, h; u32 *mem; } PTex;
+static volatile int pad_ready, audio_ready;   /* los ponen los hilos de inicio */
 static GSGLOBAL *gs;
 static PTex ptex[MAX_TEX];
 static int  nptex;
@@ -192,19 +193,50 @@ void gfx_quad(int id, const float c[8], float alpha)
 
 void gfx_end(void)
 {
+#ifndef NO_DEBUG_DOTS
+    /* Dos puntos en la esquina: mando y audio. Verde = listo, rojo = no responde. */
+    gsKit_prim_sprite(gs, 4, 4, 14, 14, 3, GS_SETREG_RGBAQ(pad_ready ? 0 : 255, pad_ready ? 200 : 0, 0, 0x80, 0));
+    gsKit_prim_sprite(gs, 18, 4, 28, 14, 3, GS_SETREG_RGBAQ(audio_ready ? 0 : 255, audio_ready ? 200 : 0, 0, 0x80, 0));
+#endif
     gsKit_queue_exec(gs);
     gsKit_sync_flip(gs);
+}
+
+/* =============================== hilos auxiliares =============================== */
+/* audsrv_init() y padInit() esperan SIN limite a que su modulo del IOP responda. Si no responde, quien los llame se
+ * queda colgado para siempre. Por eso van en hilos de BAJA prioridad: el juego nunca depende de ellos para arrancar. */
+static void start_thread(void (*fn)(void *), void *stack, int size, int prio)
+{
+    ee_thread_t th;
+    memset(&th, 0, sizeof th);
+    th.func = (void *)fn;
+    th.stack = stack;
+    th.stack_size = size;
+    th.gp_reg = &_gp;
+    th.initial_priority = prio;
+    int id = CreateThread(&th);
+    if (id < 0) { printf("JARONA: no pude crear un hilo\n"); return; }
+    StartThread(id, NULL);
 }
 
 /* =============================== audio =============================== */
 #define AUDIO_FRAMES 1024                      /* 1024 tramas a 44.1 kHz = 23 ms por bloque */
 static u8 audio_stack[32 * 1024] __attribute__((aligned(16)));
 static int16_t audio_buf[AUDIO_FRAMES * 2] __attribute__((aligned(64)));
-static int audio_ok;
 
 static void audio_thread(void *arg)
 {
     (void)arg;
+    if (audsrv_init() != 0) {
+        printf("JARONA: audsrv_init fallo: %s\n", audsrv_get_error_string());
+        ExitDeleteThread();
+    }
+    audsrv_fmt_t fmt;
+    fmt.bits = 16; fmt.freq = 44100; fmt.channels = 2;
+    audsrv_set_format(&fmt);
+    audsrv_set_volume(MAX_VOLUME);
+    audio_ready = 1;
+    ChangeThreadPriority(GetThreadId(), 0x20);                       /* ya iniciado: pasa a mas prioritario que el principal */
     for (;;) {
         mixer_render(audio_buf, AUDIO_FRAMES);                       /* musica + efectos, todo a la vez */
         audsrv_wait_audio(AUDIO_FRAMES * 4);
@@ -214,27 +246,12 @@ static void audio_thread(void *arg)
 
 static void audio_start(void)
 {
-    if (audsrv_init() != 0) { printf("JARONA: audsrv_init fallo: %s\n", audsrv_get_error_string()); return; }
-    audsrv_fmt_t fmt;
-    fmt.bits = 16; fmt.freq = 44100; fmt.channels = 2;
-    audsrv_set_format(&fmt);
-    audsrv_set_volume(MAX_VOLUME);
-
-    ee_thread_t th;
-    memset(&th, 0, sizeof th);
-    th.func = (void *)audio_thread;
-    th.stack = audio_stack;
-    th.stack_size = sizeof audio_stack;
-    th.gp_reg = &_gp;
-    th.initial_priority = 0x20;                                      /* mas prioritario que el hilo principal */
-    int id = CreateThread(&th);
-    if (id < 0) { printf("JARONA: no pude crear el hilo de audio\n"); return; }
-    StartThread(id, NULL);
-    audio_ok = 1;
+    start_thread(audio_thread, audio_stack, sizeof audio_stack, 0x60);
 }
 
 /* =============================== mando =============================== */
 static char padbuf[256] __attribute__((aligned(64)));
+static u8 pad_stack[16 * 1024] __attribute__((aligned(16)));
 
 #ifndef PAD_CROSS
 #define PAD_CROSS    0x4000
@@ -243,15 +260,24 @@ static char padbuf[256] __attribute__((aligned(64)));
 #define PAD_START    0x0008
 #endif
 
+static void pad_thread(void *arg)
+{
+    (void)arg;
+    padInit(0);                                                      /* se queda aqui si padman no responde */
+    padPortOpen(0, 0, padbuf);
+    pad_ready = 1;
+    ExitDeleteThread();
+}
+
 static void pad_start(void)
 {
-    padInit(0);
-    padPortOpen(0, 0, padbuf);
+    start_thread(pad_thread, pad_stack, sizeof pad_stack, 0x60);
 }
 
 static u32 pad_read(void)
 {
     struct padButtonStatus b;
+    if (!pad_ready) return 0;
     int st = padGetState(0, 0);
     if (st != PAD_STATE_STABLE && st != PAD_STATE_FINDCTP1) return 0;
     if (!padRead(0, 0, &b)) return 0;
@@ -260,6 +286,14 @@ static u32 pad_read(void)
 
 /* =============================== diagnostico de arranque =============================== */
 /* Cuadros verdes = etapas completadas. Si la pantalla se queda en N cuadros, el fallo esta justo despues. */
+static void stage_wait(int n)                                         /* un fotograma: n cuadros verdes + uno amarillo parpadeando */
+{
+    gfx_begin(0, 0, 48);
+    for (int i = 0; i < n; i++) gfx_rect(24.0f + i * 40, 24, 32, 32, 0, 255, 0, 1);
+    gfx_rect(24.0f + n * 40, 24, 32, 32, 255, 220, 0, 1);
+    gfx_end();
+}
+
 static void stage(int n, const char *msg)
 {
     printf("JARONA: etapa %d - %s\n", n, msg);
@@ -284,7 +318,7 @@ int main(int argc, char **argv)
     SifInitRpc(0);
     ChangeThreadPriority(GetThreadId(), 0x40);
 
-    printf("JARONA: build 2 (VRAM reducida + diagnostico)\n");
+    printf("JARONA: build 3 (mando y audio en hilos)\n");
     gfx_init();
     stage(1, "graficos iniciados");
 
@@ -294,13 +328,20 @@ int main(int argc, char **argv)
     load_irx(audsrv_irx, size_audsrv_irx, "audsrv");    stage(5, "audsrv.irx");
 
     pad_start();
-    stage(6, "mando");
+    for (int i = 0; i < 120 && !pad_ready; i++) stage_wait(5);       /* ~2 s esperando al mando */
+    if (!pad_ready) {
+        printf("JARONA: el mando no responde con los modulos incrustados: pruebo los de la BIOS (rom0:)\n");
+        SifLoadModule("rom0:SIO2MAN", 0, NULL);
+        SifLoadModule("rom0:PADMAN", 0, NULL);
+        for (int i = 0; i < 180 && !pad_ready; i++) stage_wait(5);   /* el hilo sigue esperando: se despierta solo */
+    }
+    printf("JARONA: mando %s\n", pad_ready ? "OK" : "NO responde (el juego arranca igualmente)");
+    stage(6, "mando (si ves el punto rojo arriba a la izquierda, no hay mando)");
     int load_err = game_load();                                      /* dibuja la barra de carga */
     if (load_err) printf("JARONA: game_load fallo (%d)\n", load_err);
     else {
         stage(7, "datos cargados, iniciando audio");
-        audio_start();
-        printf("JARONA: audio %s\n", audio_ok ? "OK" : "NO disponible");
+        audio_start();                                               /* en un hilo: si audsrv no responde, el juego sigue sin sonido */
     }
 
     /* El tiempo del juego avanza por fotogramas (vsync): 59.94 Hz en NTSC, 50 Hz en PAL */
@@ -322,6 +363,5 @@ int main(int argc, char **argv)
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */
         clock_ms += frame_ms;
     }
-    (void)audio_ok;
     return 0;
 }
