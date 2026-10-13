@@ -32,7 +32,7 @@ Port de `jarona/index.html` a PlayStation 2 (C + PS2SDK + gsKit + audsrv).
 - **Consola real**: ISO con OPL (USB/SMB/HDD) o grabada con FreeMcBoot/modchip.
 - **Solo el .elf** (uLaunchELF/PCSX2 "Run ELF"): copia `data/` junto al `.elf`; busca los datos en `cdrom0:`, junto al ELF (`DATA/`), `host:data/` y `data/`.
 
-## Audio (lo que pediste)
+## Audio
 En la página para PS4 el motor de respaldo usaba UN `<audio>` con `mix` y la música callaba durante cada efecto.
 Aquí **no se usa `mix`**: cada pista va por separado (`MUSICA.PCM`, `JARONA.PCM`, `ULTIMO.PCM`, `PODER.PCM`, `OMEGA.PCM`, `SECRETO.PCM`, mono 22 kHz) y `src/mixer.c` las suma por software:
 - la música es una voz que avanza siempre, en bucle y a ganancia 0.35 (fundido de entrada de 1.5 s, como la página);
