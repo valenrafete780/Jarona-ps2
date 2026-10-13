@@ -61,7 +61,9 @@ static int32_t g_prev;
 static float  U = 3.0f;               /* cada pixel de sprite = U pixeles de pantalla */
 static int    SW, SH;                 /* tamano de pantalla */
 
-static Tex t_flowery, t_pose, t_power[N_POWER], t_char[N_CHARS], t_omega[OM_COUNT], t_tree, t_floor;
+static Tex t_flowery, t_pose, t_power, t_char[N_CHARS], t_omega, t_tree, t_floor;
+static const uint8_t *pw_frames[N_POWER], *om_frames[OM_COUNT];   /* fotogramas en RAM; en VRAM solo el visible */
+static int pw_cur = -1, om_cur = -1;
 static Tex t_title, t_loading, t_hint, t_start, t_start_p, t_btnA, t_btnA_p, t_btnB, t_btnB_p;
 static const uint8_t *tree_frames[MAX_TREE];
 static int tree_count, tree_cur = -1;
@@ -206,9 +208,21 @@ int game_load(void)
     bad |= mk("floor", &t_floor, 1);
     bad |= mk("flowery", &t_flowery, 0); bad |= mk("pose", &t_pose, 0);
     char nm[16];
-    for (int i = 0; i < N_POWER; i++) { snprintf(nm, sizeof nm, "power%d", i); bad |= mk(nm, &t_power[i], 0); }
+    for (int i = 0; i < N_POWER; i++) {
+        snprintf(nm, sizeof nm, "power%d", i);
+        const Entry *e = find_entry(nm);
+        if (!e) { bad = -1; break; }
+        pw_frames[i] = texdat + e->off;
+    }
+    for (int i = 0; i < OM_COUNT; i++) {
+        snprintf(nm, sizeof nm, "om%02d", i);
+        const Entry *e = find_entry(nm);
+        if (!e) { bad = -1; break; }
+        om_frames[i] = texdat + e->off;
+    }
+    bad |= mk("power0", &t_power, 0); pw_cur = 0;
+    bad |= mk("om00", &t_omega, 0);   om_cur = 0;
     for (int i = 0; i < N_CHARS; i++) { snprintf(nm, sizeof nm, "char%d", i); bad |= mk(nm, &t_char[i], i == 5); }
-    for (int i = 0; i < OM_COUNT; i++) { snprintf(nm, sizeof nm, "om%02d", i); bad |= mk(nm, &t_omega[i], 0); }
     /* escena secreta: UNA textura que se re-sube en cada fotograma del gif (ahorra VRAM) */
     for (tree_count = 0; tree_count < MAX_TREE; tree_count++) {
         snprintf(nm, sizeof nm, "tree%02d", tree_count);
@@ -583,10 +597,14 @@ static void draw_scene(void)
     gxf = compute_xf();
     if (!flowery_hidden) spr(&t_flowery, (60 - 22) / 2.0f * U, (84 - 60) * U, 22 * U, 60 * U, 1);
     if (!pose_hidden)    spr(&t_pose, (60 - 41) / 2.0f * U, (84 - 53) * U, 41 * U, 53 * U, 1);
-    if (power_idx >= 0)  spr(&t_power[power_idx], (60 - 33) / 2.0f * U, (84 - 73) * U, 33 * U, 73 * U, 1);
+    if (power_idx >= 0) {
+        if (power_idx != pw_cur) { gfx_tex_update(t_power.id, pw_frames[power_idx]); pw_cur = power_idx; }
+        spr(&t_power, (60 - 33) / 2.0f * U, (84 - 73) * U, 33 * U, 73 * U, 1);
+    }
     if (!slide_hidden) {
         float fy = -14 * (U / 6.4f) * alt_ease(omega_t0);          /* .omega { animation: floaty } */
-        spr(&t_omega[omega_frame], (60 - 40) / 2.0f * U + slide_x, (84 - 3 - 80) * U + fy, 40 * U, 80 * U, 1);
+        if (omega_frame != om_cur) { gfx_tex_update(t_omega.id, om_frames[omega_frame]); om_cur = omega_frame; }
+        spr(&t_omega, (60 - 40) / 2.0f * U + slide_x, (84 - 3 - 80) * U + fy, 40 * U, 80 * U, 1);
     }
 
     /* fundido a blanco, y por encima de el los personajes que orbitan */

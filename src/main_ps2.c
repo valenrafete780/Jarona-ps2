@@ -86,6 +86,10 @@ typedef struct { GSTEXTURE t; int w, h; u32 *mem; } PTex;
 static GSGLOBAL *gs;
 static PTex ptex[MAX_TEX];
 static int  nptex;
+static u32  vram_used;
+#ifndef GSKIT_ALLOC_ERROR
+#define GSKIT_ALLOC_ERROR 0xFFFFFFFFu
+#endif
 
 static int p2(int v) { int p = 8; while (p < v) p <<= 1; return p; }
 
@@ -135,7 +139,13 @@ int gfx_tex_create(int w, int h, const uint8_t *rgba, int smooth)
     if (!p->mem) return -1;
     p->t.Mem = p->mem;
     tex_fill(p, rgba);
-    p->t.Vram = gsKit_vram_alloc(gs, gsKit_texture_size(p->t.Width, p->t.Height, p->t.PSM), GSKIT_ALLOC_USERBUFFER);
+    u32 sz = gsKit_texture_size(p->t.Width, p->t.Height, p->t.PSM);
+    p->t.Vram = gsKit_vram_alloc(gs, sz, GSKIT_ALLOC_USERBUFFER);
+    vram_used += sz;
+    if (p->t.Vram == GSKIT_ALLOC_ERROR) {
+        printf("JARONA: SIN VRAM en la textura %d (%dx%d), usado hasta ahora %u bytes\n", nptex, p->w, p->h, (unsigned)vram_used);
+        return -1;                                                    /* game_load lo detecta: pantalla roja, sin colgar la GS */
+    }
     gsKit_texture_upload(gs, &p->t);
     return nptex++;
 }
@@ -248,6 +258,18 @@ static u32 pad_read(void)
     return 0xffff ^ b.btns;                                          /* los botones llegan invertidos */
 }
 
+/* =============================== diagnostico de arranque =============================== */
+/* Cuadros verdes = etapas completadas. Si la pantalla se queda en N cuadros, el fallo esta justo despues. */
+static void stage(int n, const char *msg)
+{
+    printf("JARONA: etapa %d - %s\n", n, msg);
+    for (int k = 0; k < 2; k++) {                                     /* 2 fotogramas: se ve en los dos buffers */
+        gfx_begin(0, 0, 48);
+        for (int i = 0; i < n; i++) gfx_rect(24.0f + i * 40, 24, 32, 32, 0, 255, 0, 1);
+        gfx_end();
+    }
+}
+
 /* =============================== modulos IOP =============================== */
 static void load_irx(void *buf, unsigned size, const char *what)
 {
@@ -262,15 +284,24 @@ int main(int argc, char **argv)
     SifInitRpc(0);
     ChangeThreadPriority(GetThreadId(), 0x40);
 
-    load_irx(sio2man_irx, size_sio2man_irx, "sio2man");
-    load_irx(padman_irx, size_padman_irx, "padman");
-    load_irx(libsd_irx, size_libsd_irx, "libsd");
-    load_irx(audsrv_irx, size_audsrv_irx, "audsrv");
-
+    printf("JARONA: build 2 (VRAM reducida + diagnostico)\n");
     gfx_init();
+    stage(1, "graficos iniciados");
+
+    load_irx(sio2man_irx, size_sio2man_irx, "sio2man"); stage(2, "sio2man");
+    load_irx(padman_irx, size_padman_irx, "padman");    stage(3, "padman");
+    load_irx(libsd_irx, size_libsd_irx, "libsd");       stage(4, "libsd");
+    load_irx(audsrv_irx, size_audsrv_irx, "audsrv");    stage(5, "audsrv.irx");
+
     pad_start();
+    stage(6, "mando");
     int load_err = game_load();                                      /* dibuja la barra de carga */
-    if (!load_err) audio_start();
+    if (load_err) printf("JARONA: game_load fallo (%d)\n", load_err);
+    else {
+        stage(7, "datos cargados, iniciando audio");
+        audio_start();
+        printf("JARONA: audio %s\n", audio_ok ? "OK" : "NO disponible");
+    }
 
     /* El tiempo del juego avanza por fotogramas (vsync): 59.94 Hz en NTSC, 50 Hz en PAL */
     const float frame_ms = (gs->Mode == GS_MODE_PAL) ? 20.0f : 16.6833f;
