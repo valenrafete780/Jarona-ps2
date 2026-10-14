@@ -169,7 +169,8 @@ static int mk(const char *name, Tex *t, int smooth)
 static void draw_bar_screen(int show_title, float frac);
 
 /* ---- carga en segundo plano (hilo aparte): musica (4 MB), pista secreta (1.3 MB) y arbol secreto (0.7 MB) ---- */
-static const char *const BG_FILES[3] = { "MUSICA.ULW", "SECRETO.ULW", "TREE.DAT" };
+/* Orden: primero el arbol (0.7 MB, lo unico que necesita la escena secreta), luego la musica y la pista secreta */
+static const char *const BG_FILES[3] = { "TREE.DAT", "MUSICA.ULW", "SECRETO.ULW" };
 static int bg_done[3];
 static int music_wanted, music_loaded, tree_ready;
 
@@ -184,9 +185,9 @@ static void bg_poll(void)
         if (r == 0) break;                                   /* se cargan en orden: si esta no esta, las siguientes tampoco */
         bg_done[i] = 1;
         if (r < 0 || !data) { plat_log("fallo cargando un fichero"); continue; }
-        if (i == 0) { plat_log("musica lista"); mixer_set_music((const uint8_t *)data, size); music_loaded = 1; if (music_wanted) mixer_music_start(); }
-        else if (i == 1) { mixer_set_secret((const uint8_t *)data, size); plat_log("pista secreta lista"); }
-        else tree_init((const uint8_t *)data, size);
+        if (i == 0) tree_init((const uint8_t *)data, size);
+        else if (i == 1) { plat_log("musica lista"); mixer_set_music((const uint8_t *)data, size); music_loaded = 1; if (music_wanted) mixer_music_start(); }
+        else { mixer_set_secret((const uint8_t *)data, size); plat_log("pista secreta lista"); }
     }
 }
 
@@ -464,11 +465,12 @@ static void slide_done(void)
 static void open_secret(void)
 {
     if (secret_on) return;
-    if (!mixer_has_secret() || !tree_ready) {
+    if (!tree_ready) {                                /* lo unico imprescindible es el arbol; el audio es opcional */
         static int said;
-        if (!said) { said = 1; plat_log(mixer_has_secret() ? "secreto: falta el arbol" : "secreto: falta el audio"); }
+        if (!said) { said = 1; plat_log("secreto: aun falta el arbol"); }
         return;
     }
+    if (!mixer_has_secret()) plat_log("secreto SIN audio (aun no cargado)");
     secret_on = 1;                                   /* no hay salida: solo reiniciando la consola */
     mixer_enter_secret();                            /* calla musica y efectos, suena "secreto" en bucle */
     secret_t0 = g_now;

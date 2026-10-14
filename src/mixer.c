@@ -34,7 +34,7 @@ static void build_ulaw(void)
 static Voice voices[MIX_VOICES];
 static uint32_t next_steal;
 
-static volatile int music_on, secret_on;
+static volatile int music_on, secret_on, secret_silenced;
 static uint32_t music_pos, secret_pos;
 static float mgain, fxgain, sgain = 1.0f;      /* ganancias actuales */
 static float mtarget, fxtarget = 1.0f;         /* ganancias objetivo */
@@ -52,7 +52,7 @@ void mixer_init(void)
     memset(voices, 0, sizeof voices);
     memset(&music, 0, sizeof music);
     memset(&secret, 0, sizeof secret);
-    music_on = secret_on = 0;
+    music_on = secret_on = secret_silenced = 0;
     music_pos = secret_pos = 0;
     mgain = 0; mtarget = 0; mstep = 0;
     fxgain = fxtarget = 1.0f; fxstep = 0;
@@ -76,7 +76,7 @@ void mixer_music_start(void)
     if (music_on || !music.d || !music.n) return;
     music_pos = 0;
     mgain = 0;
-    ramp_music(secret_on ? 0.0f : MUSIC_GAIN, MUSIC_FADEIN);
+    ramp_music(secret_silenced ? 0.0f : MUSIC_GAIN, MUSIC_FADEIN);
     barrier();
     music_on = 1;
 }
@@ -97,13 +97,16 @@ void mixer_play_sfx(int id)
 
 void mixer_enter_secret(void)
 {
-    if (secret_on || !secret.d || !secret.n) return;
-    secret_pos = 0; sgain = 1.0f;
-    ramp_music(0.0f, SECRET_MUS_OFF);
+    if (secret_silenced) return;
+    secret_silenced = 1;
+    ramp_music(0.0f, SECRET_MUS_OFF);                /* calla la musica y los efectos aunque no haya pista secreta */
     fxtarget = 0.0f;
     fxstep = (0.0f - fxgain) / (SECRET_FX_OFF * MIX_RATE);
-    barrier();
-    secret_on = 1;
+    if (secret.d && secret.n) {                      /* si la pista secreta esta cargada, suena en bucle */
+        secret_pos = 0; sgain = 1.0f;
+        barrier();
+        secret_on = 1;
+    }
 }
 
 uint32_t mixer_sfx_ms(int id) { return sfx[id].d ? (uint32_t)((uint64_t)sfx[id].n * 1000 / MIX_RATE) : 0; }

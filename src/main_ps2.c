@@ -87,18 +87,23 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
 static char logl[LOG_LINES][LOG_COLS + 1];
 static volatile int log_dirty;
 
+static volatile int g_frames;                       /* fotogramas desde que arranco el bucle principal (para marcar el tiempo) */
+
 static void dbg_log(const char *fmt, ...)
 {
-    char tmp[96];
+    char tmp[96], line[112];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
-    printf("JARONA: %s\n", tmp);
+    snprintf(line, sizeof line, "%d %s", g_frames / 50, tmp);   /* segundos aprox. delante de cada linea */
+    printf("JARONA: %s\n", line);
+    int en = DIntr();                                /* varios hilos escriben: se desactivan las interrupciones un instante */
     for (int i = 0; i < LOG_LINES - 1; i++) memcpy(logl[i], logl[i + 1], LOG_COLS + 1);
     memset(logl[LOG_LINES - 1], 0, LOG_COLS + 1);
-    strncpy(logl[LOG_LINES - 1], tmp, LOG_COLS);
+    strncpy(logl[LOG_LINES - 1], line, LOG_COLS);
     log_dirty = 1;
+    if (en) EIntr();
 }
 
 void plat_log(const char *msg) { dbg_log("%s", msg); }
@@ -304,6 +309,7 @@ static void loader_thread(void *arg)
         fseek(f, 0, SEEK_END);
         long n = ftell(f);
         fseek(f, 0, SEEK_SET);
+        dbg_log("leyendo %s %ldK", a_names[i], n / 1024);
         uint8_t *buf = (uint8_t *)malloc((size_t)n + 16);
         long done = 0;
         if (buf) {
@@ -312,6 +318,7 @@ static void loader_thread(void *arg)
                 long r = (long)fread(buf + done, 1, (size_t)k, f);
                 if (r <= 0) break;
                 done += r;
+                if (done < n) dbg_log("%s %ld/%ldK", a_names[i], done / 1024, n / 1024);
             }
         }
         fclose(f);
@@ -319,7 +326,7 @@ static void loader_thread(void *arg)
         ares[i].data = buf; ares[i].size = (uint32_t)n;
         __sync_synchronize();
         ares[i].state = 1;
-        dbg_log("%s cargado %ldK", a_names[i], n / 1024);
+        dbg_log("%s cargado", a_names[i]);
     }
     ExitDeleteThread();
 }
@@ -373,6 +380,7 @@ static void audio_thread(void *arg)
 }
 
 static volatile int audio_thread_started;
+static int id_libsd, id_audsrv;
 
 /* 1 = el servidor de audsrv existe en el IOP, 0 = no, -1 = error al preguntar. Una sola consulta, no se queda esperando. */
 static int audsrv_bound(void)
@@ -445,18 +453,32 @@ static void stage(int n, const char *msg)
 }
 
 /* =============================== modulos IOP =============================== */
-static int load_irx(void *buf, unsigned size, const char *what)
+static int load_irx(void *buf, unsigned size, const char *what, int *out_id)
 {
     int ret = 0;
     int id = SifExecModuleBuffer(buf, size, 0, NULL, &ret);
     dbg_log("%s id=%d ret=%d", what, id, ret);
+    if (out_id) *out_id = id;
     return (id < 0 || ret == 1) ? -1 : 1;
 }
+
+/* descarga un modulo del IOP (para volver a cargarlo de otra forma) */
+static void unload_mod(int id, const char *what)
+{
+    if (id <= 0) return;
+    int r = 0;
+    int s = SifStopModule(id, 0, NULL, &r);
+    int u = SifUnloadModule(id);
+    dbg_log("quito %s: stop=%d unl=%d", what, s, u);
+}
+
+static int last_rom_id;
 
 static int load_rom(const char *path)
 {
     int id = SifLoadModule(path, 0, NULL);
     dbg_log("rom0 %s id=%d", path + 5, id);
+    last_rom_id = id;
     return id >= 0 ? 1 : -1;
 }
 
@@ -482,8 +504,8 @@ int main(int argc, char **argv)
     dbg_log("build 7 - parche LMB=%d/%d", lmb, pfx);
 
     /* Audio: tambien en segundo plano; asi puede arrancar mientras se leen los datos del disco */
-    mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd");
-    mod_state[3] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv");
+    mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd", &id_libsd);
+    mod_state[3] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
     stage(3, "modulos de audio cargados");
 
     int load_err = game_load();                                      /* solo texturas + 4 efectos (~1.5 MB); lo demas llega despues */
@@ -508,6 +530,7 @@ int main(int argc, char **argv)
 
         /* Si el audio sigue sin responder, reintentos con otras combinaciones de modulos (se ven en los puntos) */
         frames++;
+        g_frames = frames;
         if (pad_ready && !pad_logged) { pad_logged = 1; dbg_log("mando OK (cuadro %d)", frames); }
         if (audio_ready && !audio_logged) { audio_logged = 1; dbg_log("AUDIO OK (cuadro %d)", frames); }
         if (!audio_thread_started && frames % 15 == 0) {
@@ -516,19 +539,22 @@ int main(int argc, char **argv)
             if (b > 0) audio_start();
             else if (frames >= 600) { dbg_log("llamo a audsrv_init igualmente"); audio_start(); }
         }
-        if (!audio_ready && audio_retry == 0 && frames == 150) {
+        /* Reintentos: cada uno DESCARGA lo anterior y vuelve a cargar con otra combinacion de libsd */
+        if (!audio_ready && !audio_thread_started && audio_retry == 0 && frames == 120) {
             audio_retry = 1;
-            dbg_log("2o intento: rom0 LIBSD");
-            mod_state[4] = load_rom("rom0:LIBSD");
-            mod_state[5] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv (2o intento)");
-            if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
-        } else if (!audio_ready && audio_retry == 1 && frames == 400) {
+            dbg_log("2o intento: libsd de la BIOS");
+            unload_mod(id_audsrv, "audsrv"); unload_mod(id_libsd, "libsd");
+            mod_state[4] = load_rom("rom0:LIBSD"); id_libsd = last_rom_id;
+            mod_state[5] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
+        } else if (!audio_ready && !audio_thread_started && audio_retry == 1 && frames == 300) {
             audio_retry = 2;
-            dbg_log("3er intento: libsd+audsrv");
-            mod_state[8] = load_irx(libsd_irx, size_libsd_irx, "libsd (3er intento)");
-            mod_state[9] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv (3er intento)");
-            if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
+            dbg_log("3er intento: libsd propio + pausa");
+            unload_mod(id_audsrv, "audsrv"); unload_mod(id_libsd, "libsd");
+            mod_state[8] = load_irx(libsd_irx, size_libsd_irx, "libsd", &id_libsd);
+            DelayThread(500 * 1000);                                  /* medio segundo para que libsd termine de iniciar */
+            mod_state[9] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
         }
+        if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */
         clock_ms += frame_ms;
     }
