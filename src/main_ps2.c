@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <stdarg.h>
 #include <tamtypes.h>
 #include <kernel.h>
@@ -28,6 +30,9 @@
 
 /* modulos IOP incrustados en el ELF (los genera el Makefile con bin2c) */
 extern unsigned char libsd_irx[];   extern unsigned int size_libsd_irx;
+#ifdef HAVE_FREESD
+extern unsigned char freesd_irx[];  extern unsigned int size_freesd_irx;   /* si la imagen de ps2dev trae freesd, es el que usan OPL y compania */
+#endif
 extern unsigned char audsrv_irx[];  extern unsigned int size_audsrv_irx;
 
 extern void *_gp;
@@ -44,37 +49,44 @@ static void set_base_dir(const char *argv0)
     if (last >= 0 && last < (int)sizeof g_dir - 1) { memcpy(g_dir, argv0, last + 1); g_dir[last + 1] = 0; }
 }
 
-static FILE *open_data(const char *name)
+/* IMPORTANTE: se usa open()/read() con bloques grandes. fread() en la PS2 lee de ~1 KB en ~1 KB aunque se le pida 1 MB,
+ * y cada trozo es una llamada lenta al IOP: leer 672 KB tardaba mas de 30 s en el emulador. */
+static int open_data_fd(const char *name)
 {
     char p[256];
-    FILE *f;
-    snprintf(p, sizeof p, "cdrom0:\\%s;1", name);        if ((f = fopen(p, "rb"))) return f;   /* ISO / disco */
-    snprintf(p, sizeof p, "%s%s", g_dir, name);          if ((f = fopen(p, "rb"))) return f;
-    snprintf(p, sizeof p, "%sDATA/%s", g_dir, name);     if ((f = fopen(p, "rb"))) return f;
-    snprintf(p, sizeof p, "%sdata/%s", g_dir, name);     if ((f = fopen(p, "rb"))) return f;
-    snprintf(p, sizeof p, "host:data/%s", name);         if ((f = fopen(p, "rb"))) return f;
-    snprintf(p, sizeof p, "data/%s", name);              if ((f = fopen(p, "rb"))) return f;
-    return NULL;
+    int fd;
+    snprintf(p, sizeof p, "cdrom0:\\%s;1", name);        if ((fd = open(p, O_RDONLY)) >= 0) return fd;   /* ISO / disco */
+    snprintf(p, sizeof p, "%s%s", g_dir, name);          if ((fd = open(p, O_RDONLY)) >= 0) return fd;
+    snprintf(p, sizeof p, "%sDATA/%s", g_dir, name);     if ((fd = open(p, O_RDONLY)) >= 0) return fd;
+    snprintf(p, sizeof p, "%sdata/%s", g_dir, name);     if ((fd = open(p, O_RDONLY)) >= 0) return fd;
+    snprintf(p, sizeof p, "host:data/%s", name);         if ((fd = open(p, O_RDONLY)) >= 0) return fd;
+    snprintf(p, sizeof p, "data/%s", name);              if ((fd = open(p, O_RDONLY)) >= 0) return fd;
+    return -1;
 }
 
-void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uint32_t))
+static long read_all(int fd, uint8_t *buf, long n, void (*progress)(uint32_t, uint32_t))
 {
-    FILE *f = open_data(name);
-    if (!f) { printf("JARONA: no encuentro %s\n", name); return NULL; }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = (uint8_t *)memalign(64, (size_t)n + 64);
-    if (!buf) { printf("JARONA: sin memoria para %s (%ld bytes)\n", name, n); fclose(f); return NULL; }
     long done = 0;
     while (done < n) {
         long k = n - done > 1048576 ? 1048576 : n - done;
-        long r = (long)fread(buf + done, 1, (size_t)k, f);
+        long r = (long)read(fd, buf + done, (size_t)k);
         if (r <= 0) break;
         done += r;
         if (progress) progress((uint32_t)done, (uint32_t)n);
     }
-    fclose(f);
+    return done;
+}
+
+void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uint32_t))
+{
+    int fd = open_data_fd(name);
+    if (fd < 0) return NULL;
+    long n = (long)lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    uint8_t *buf = (n > 0) ? (uint8_t *)memalign(64, (size_t)n + 64) : NULL;
+    if (!buf) { close(fd); return NULL; }
+    long done = read_all(fd, buf, n, progress);
+    close(fd);
     if (done != n) { free(buf); return NULL; }
     *size = (uint32_t)n;
     return buf;
@@ -97,7 +109,6 @@ static void dbg_log(const char *fmt, ...)
     vsnprintf(tmp, sizeof tmp, fmt, ap);
     va_end(ap);
     snprintf(line, sizeof line, "%d %s", g_frames / 50, tmp);   /* segundos aprox. delante de cada linea */
-    printf("JARONA: %s\n", line);
     int en = DIntr();                                /* varios hilos escriben: se desactivan las interrupciones un instante */
     for (int i = 0; i < LOG_LINES - 1; i++) memcpy(logl[i], logl[i + 1], LOG_COLS + 1);
     memset(logl[LOG_LINES - 1], 0, LOG_COLS + 1);
@@ -304,24 +315,14 @@ static void loader_thread(void *arg)
 {
     (void)arg;
     for (int i = 0; i < a_n; i++) {
-        FILE *f = open_data(a_names[i]);
-        if (!f) { dbg_log("%s: NO ENCONTRADO", a_names[i]); ares[i].state = -1; continue; }
-        fseek(f, 0, SEEK_END);
-        long n = ftell(f);
-        fseek(f, 0, SEEK_SET);
+        int fd = open_data_fd(a_names[i]);
+        if (fd < 0) { dbg_log("%s: NO ENCONTRADO", a_names[i]); ares[i].state = -1; continue; }
+        long n = (long)lseek(fd, 0, SEEK_END);
+        lseek(fd, 0, SEEK_SET);
         dbg_log("leyendo %s %ldK", a_names[i], n / 1024);
-        uint8_t *buf = (uint8_t *)malloc((size_t)n + 16);
-        long done = 0;
-        if (buf) {
-            while (done < n) {                                        /* este hilo se duerme esperando al disco; el juego no */
-                long k = n - done > 1048576 ? 1048576 : n - done;
-                long r = (long)fread(buf + done, 1, (size_t)k, f);
-                if (r <= 0) break;
-                done += r;
-                if (done < n) dbg_log("%s %ld/%ldK", a_names[i], done / 1024, n / 1024);
-            }
-        }
-        fclose(f);
+        uint8_t *buf = (n > 0) ? (uint8_t *)memalign(64, (size_t)n + 64) : NULL;
+        long done = buf ? read_all(fd, buf, n, NULL) : 0;
+        close(fd);
         if (!buf || done != n) { free(buf); dbg_log("%s: lectura incompleta", a_names[i]); ares[i].state = -1; continue; }
         ares[i].data = buf; ares[i].size = (uint32_t)n;
         __sync_synchronize();
@@ -380,7 +381,6 @@ static void audio_thread(void *arg)
 }
 
 static volatile int audio_thread_started;
-static int id_libsd, id_audsrv;
 
 /* 1 = el servidor de audsrv existe en el IOP, 0 = no, -1 = error al preguntar. Una sola consulta, no se queda esperando. */
 static int audsrv_bound(void)
@@ -394,7 +394,7 @@ static int audsrv_bound(void)
 static void audio_start(void)
 {
     audio_thread_started = 1;
-    start_thread(audio_thread, audio_stack, sizeof audio_stack, 0x60);
+    start_thread(audio_thread, audio_stack, sizeof audio_stack, 0x50);   /* por encima del cargador (0x58): el servidor ya existe, la init es rapida */
 }
 
 /* =============================== mando =============================== */
@@ -462,16 +462,6 @@ static int load_irx(void *buf, unsigned size, const char *what, int *out_id)
     return (id < 0 || ret == 1) ? -1 : 1;
 }
 
-/* descarga un modulo del IOP (para volver a cargarlo de otra forma) */
-static void unload_mod(int id, const char *what)
-{
-    if (id <= 0) return;
-    int r = 0;
-    int s = SifStopModule(id, 0, NULL, &r);
-    int u = SifUnloadModule(id);
-    dbg_log("quito %s: stop=%d unl=%d", what, s, u);
-}
-
 static int last_rom_id;
 
 static int load_rom(const char *path)
@@ -504,8 +494,12 @@ int main(int argc, char **argv)
     dbg_log("build 7 - parche LMB=%d/%d", lmb, pfx);
 
     /* Audio: tambien en segundo plano; asi puede arrancar mientras se leen los datos del disco */
-    mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd", &id_libsd);
-    mod_state[3] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
+#ifdef HAVE_FREESD
+    mod_state[2] = load_irx(freesd_irx, size_freesd_irx, "freesd", NULL);
+#else
+    mod_state[2] = load_irx(libsd_irx, size_libsd_irx, "libsd", NULL);
+#endif
+    mod_state[3] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", NULL);
     stage(3, "modulos de audio cargados");
 
     int load_err = game_load();                                      /* solo texturas + 4 efectos (~1.5 MB); lo demas llega despues */
@@ -515,7 +509,7 @@ int main(int argc, char **argv)
     const float frame_ms = (gs->Mode == GS_MODE_PAL) ? 20.0f : 16.6833f;
     double clock_ms = 0;
     u32 prev = 0;
-    int frames = 0, audio_retry = 0, pad_logged = 0, audio_logged = 0, last_bound = -2;
+    int frames = 0, pad_logged = 0, audio_logged = 0, last_bound = -2;
     for (;;) {
         u32 cur = pad_read();
         u32 pressed = cur & ~prev, released = prev & ~cur;
@@ -536,24 +530,8 @@ int main(int argc, char **argv)
         if (!audio_thread_started && frames % 15 == 0) {
             int b = audsrv_bound();
             if (b != last_bound) { last_bound = b; dbg_log("servidor audsrv: %s", b > 0 ? "EXISTE" : (b == 0 ? "NO existe" : "ERROR")); }
-            if (b > 0) audio_start();
-            else if (frames >= 600) { dbg_log("llamo a audsrv_init igualmente"); audio_start(); }
-        }
-        /* Reintentos: cada uno DESCARGA lo anterior y vuelve a cargar con otra combinacion de libsd */
-        if (!audio_ready && !audio_thread_started && audio_retry == 0 && frames == 120) {
-            audio_retry = 1;
-            dbg_log("2o intento: libsd de la BIOS");
-            unload_mod(id_audsrv, "audsrv"); unload_mod(id_libsd, "libsd");
-            mod_state[4] = load_rom("rom0:LIBSD"); id_libsd = last_rom_id;
-            mod_state[5] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
-        } else if (!audio_ready && !audio_thread_started && audio_retry == 1 && frames == 300) {
-            audio_retry = 2;
-            dbg_log("3er intento: libsd propio");
-            unload_mod(id_audsrv, "audsrv"); unload_mod(id_libsd, "libsd");
-            mod_state[8] = load_irx(libsd_irx, size_libsd_irx, "libsd", &id_libsd);
-        } else if (!audio_ready && !audio_thread_started && audio_retry == 2 && frames == 330) {
-            audio_retry = 3;                                          /* ~0.6 s despues: libsd ya termino de iniciar */
-            mod_state[9] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
+            if (b > 0) audio_start();            /* solo se arranca si el servidor EXISTE: asi el hilo nunca se queda girando sin fin */
+            else if (frames % 300 == 0) dbg_log("sondeo audsrv: sigue sin existir");
         }
         if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */
