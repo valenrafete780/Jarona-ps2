@@ -6,6 +6,9 @@
 #
 # Necesita las variables PS2DEV y PS2SDK (las pone el instalador de ps2dev o su imagen de Docker).
 
+# El objetivo por defecto es SIEMPRE 'all' (antes una regla auxiliar puesta delante hacia que make no compilara nada)
+.DEFAULT_GOAL := all
+
 EE_BIN     = JARONA.ELF
 EE_BIN_PKD = JARONA-packed.ELF
 
@@ -29,13 +32,7 @@ vpath %.c src
 %_irx.c: $(PS2SDK)/iop/irx/%.irx
 	$(PS2SDK)/bin/bin2c $< $@ $*_irx
 
-# 'info' imprime en el registro de la compilacion que modulos de sonido trae el SDK (para diagnosticar el audio)
-info:
-	@echo "=== MODULOS IOP DISPONIBLES ==="; ls $(PS2SDK)/iop/irx | tr '\n' ' '; echo
-	@echo "=== audsrv.irx ==="; grep -a -o -E '[[:print:]]{8,}' $(PS2SDK)/iop/irx/audsrv.irx | head -25
-	@echo "=== libsd.irx ==="; grep -a -o -E '[[:print:]]{8,}' $(PS2SDK)/iop/irx/libsd.irx | head -25
-
-all: info $(EE_BIN)
+all: $(EE_BIN)
 
 clean:
 	rm -f $(EE_BIN) $(EE_BIN_PKD) *.o *_irx.c
