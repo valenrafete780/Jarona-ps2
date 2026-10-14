@@ -13,6 +13,12 @@ EE_OBJS = main_ps2.o game.o mixer.o \
           libsd_irx.o audsrv_irx.o
 
 EE_CFLAGS += -O2 -Wall -Wno-unused-function
+
+# Si la imagen de ps2dev trae freesd.irx (el libsd libre que usan OPL y otros), se incrusta y se usa en lugar de libsd.irx
+ifneq ($(wildcard $(PS2SDK)/iop/irx/freesd.irx),)
+EE_OBJS += freesd_irx.o
+EE_CFLAGS += -DHAVE_FREESD
+endif
 EE_INCS   += -Isrc -I$(PS2DEV)/gsKit/include -I$(PS2SDK)/ports/include
 EE_LDFLAGS += -L$(PS2DEV)/gsKit/lib -L$(PS2SDK)/ports/lib
 EE_LIBS   += -lgskit -ldmakit -laudsrv -lpad -lpatches -lm
@@ -23,7 +29,13 @@ vpath %.c src
 %_irx.c: $(PS2SDK)/iop/irx/%.irx
 	$(PS2SDK)/bin/bin2c $< $@ $*_irx
 
-all: $(EE_BIN)
+# 'info' imprime en el registro de la compilacion que modulos de sonido trae el SDK (para diagnosticar el audio)
+info:
+	@echo "=== MODULOS IOP DISPONIBLES ==="; ls $(PS2SDK)/iop/irx | tr '\n' ' '; echo
+	@echo "=== audsrv.irx ==="; grep -a -o -E '[[:print:]]{8,}' $(PS2SDK)/iop/irx/audsrv.irx | head -25
+	@echo "=== libsd.irx ==="; grep -a -o -E '[[:print:]]{8,}' $(PS2SDK)/iop/irx/libsd.irx | head -25
+
+all: info $(EE_BIN)
 
 clean:
 	rm -f $(EE_BIN) $(EE_BIN_PKD) *.o *_irx.c
