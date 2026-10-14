@@ -548,10 +548,11 @@ int main(int argc, char **argv)
             mod_state[5] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
         } else if (!audio_ready && !audio_thread_started && audio_retry == 1 && frames == 300) {
             audio_retry = 2;
-            dbg_log("3er intento: libsd propio + pausa");
+            dbg_log("3er intento: libsd propio");
             unload_mod(id_audsrv, "audsrv"); unload_mod(id_libsd, "libsd");
             mod_state[8] = load_irx(libsd_irx, size_libsd_irx, "libsd", &id_libsd);
-            DelayThread(500 * 1000);                                  /* medio segundo para que libsd termine de iniciar */
+        } else if (!audio_ready && !audio_thread_started && audio_retry == 2 && frames == 330) {
+            audio_retry = 3;                                          /* ~0.6 s despues: libsd ya termino de iniciar */
             mod_state[9] = load_irx(audsrv_irx, size_audsrv_irx, "audsrv", &id_audsrv);
         }
         if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
