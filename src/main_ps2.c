@@ -99,6 +99,12 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
 static char logl[LOG_LINES][LOG_COLS + 1];
 static volatile int log_dirty;
 
+/* SELECT oculta/muestra los indicadores y el registro. Compilando con -DNO_DEBUG_DOTS arrancan ocultos. */
+#ifdef NO_DEBUG_DOTS
+static volatile int dbg_show = 0;
+#else
+static volatile int dbg_show = 1;
+#endif
 static volatile int g_frames;                       /* fotogramas desde que arranco el bucle principal (para marcar el tiempo) */
 
 static void dbg_log(const char *fmt, ...)
@@ -268,21 +274,20 @@ static int log_tex = -1;
 
 void gfx_end(void)
 {
-    if (log_tex < 0 && nptex < MAX_TEX) { log_render(); log_tex = gfx_tex_create(LOGW, LOGH, log_px, 0); }
-    if (log_tex >= 0) {
-        if (log_dirty) { log_dirty = 0; log_render(); gfx_tex_update(log_tex, log_px); }
-        float y = (float)gs->Height - LOGH - 4, c[8] = { 4, y, 4 + LOGW, y, 4 + LOGW, y + LOGH, 4, y + LOGH };
-        gfx_quad(log_tex, c, 1.0f);
+    if (dbg_show) {
+        if (log_tex < 0 && nptex < MAX_TEX) { log_render(); log_tex = gfx_tex_create(LOGW, LOGH, log_px, 0); }
+        if (log_tex >= 0) {
+            if (log_dirty) { log_dirty = 0; log_render(); gfx_tex_update(log_tex, log_px); }
+            float y = (float)gs->Height - LOGH - 4, c[8] = { 4, y, 4 + LOGW, y, 4 + LOGW, y + LOGH, 4, y + LOGH };
+            gfx_quad(log_tex, c, 1.0f);
+        }
+        /* Fila 1: mando | audio | etapa de audsrv_init (gris = hilo sin arrancar, amarillo = esperando, verde = hecho).
+         * Fila 2: modulos IOP: SIO2MAN y PADMAN (BIOS), freesd, audsrv. Gris = sin intentar, verde = cargado, rojo = fallo. */
+        gsKit_prim_sprite(gs, 4, 4, 14, 14, 3, dot(pad_ready ? 1 : 0));
+        gsKit_prim_sprite(gs, 18, 4, 28, 14, 3, dot(audio_ready ? 1 : (audio_failed ? -1 : 0)));
+        gsKit_prim_sprite(gs, 32, 4, 42, 14, 3, dot(audio_stage == 0 ? 9 : (audio_stage == 1 ? 0 : 1)));
+        for (int i = 0; i < 10; i++) gsKit_prim_sprite(gs, 4.0f + i * 10, 18, 11.0f + i * 10, 25, 3, dot(mod_state[i] ? mod_state[i] : 9));
     }
-#ifndef NO_DEBUG_DOTS
-    /* Fila 1: mando | audio | etapa de audsrv_init (gris = hilo sin arrancar, amarillo = esperando, verde = hecho).
-     * Fila 2: modulos IOP: SIO2MAN y PADMAN (BIOS), libsd, audsrv, libsd (BIOS, 2o intento), audsrv (2o), (sin usar)
-     *         (sin usar), libsd y audsrv (3er intento). Gris = sin intentar, verde = cargado, rojo = fallo. */
-    gsKit_prim_sprite(gs, 4, 4, 14, 14, 3, dot(pad_ready ? 1 : 0));
-    gsKit_prim_sprite(gs, 18, 4, 28, 14, 3, dot(audio_ready ? 1 : (audio_failed ? -1 : 0)));
-    gsKit_prim_sprite(gs, 32, 4, 42, 14, 3, dot(audio_stage == 0 ? 9 : (audio_stage == 1 ? 0 : 1)));
-    for (int i = 0; i < 10; i++) gsKit_prim_sprite(gs, 4.0f + i * 10, 18, 11.0f + i * 10, 25, 3, dot(mod_state[i] ? mod_state[i] : 9));
-#endif
     gsKit_queue_exec(gs);
     gsKit_sync_flip(gs);
 }
@@ -338,6 +343,13 @@ void plat_async_begin(const char *const *names, int n)
     a_n = n < 8 ? n : 8;
     dbg_log("carga en 2o plano: %d ficheros", a_n);
     start_thread(loader_thread, loader_stack, sizeof loader_stack, 0x58);   /* por debajo del juego, por encima del audio en espera */
+}
+
+static int async_all_done(void)
+{
+    if (a_n == 0) return 0;
+    for (int i = 0; i < a_n; i++) if (ares[i].state == 0) return 0;
+    return 1;
 }
 
 int plat_async_poll(int i, void **data, uint32_t *size)
@@ -406,6 +418,10 @@ static u8 pad_stack[16 * 1024] __attribute__((aligned(16)));
 #define PAD_CIRCLE   0x2000
 #define PAD_TRIANGLE 0x1000
 #define PAD_START    0x0008
+#endif
+
+#ifndef PAD_SELECT
+#define PAD_SELECT   0x0001
 #endif
 
 static void pad_thread(void *arg)
@@ -520,6 +536,7 @@ int main(int argc, char **argv)
         in.swap_down  = (pressed  & (PAD_TRIANGLE | PAD_CIRCLE)) != 0;
         in.swap_up    = (released & (PAD_TRIANGLE | PAD_CIRCLE)) != 0;
         in.start_down = (pressed  & PAD_START) != 0;
+        if (pressed & PAD_SELECT) dbg_show = !dbg_show;                /* SELECT: oculta o muestra los indicadores */
         prev = cur;
 
         /* Si el audio sigue sin responder, reintentos con otras combinaciones de modulos (se ven en los puntos) */
@@ -530,8 +547,10 @@ int main(int argc, char **argv)
         if (!audio_thread_started && frames % 15 == 0) {
             int b = audsrv_bound();
             if (b != last_bound) { last_bound = b; dbg_log("servidor audsrv: %s", b > 0 ? "EXISTE" : (b == 0 ? "NO existe" : "ERROR")); }
-            if (b > 0) audio_start();            /* solo se arranca si el servidor EXISTE: asi el hilo nunca se queda girando sin fin */
-            else if (frames % 300 == 0) dbg_log("sondeo audsrv: sigue sin existir");
+            if (b > 0) audio_start();
+            /* Con TODA la carga terminada el hilo de lectura ya no acapara el procesador: ahora si se prueba audsrv_init de
+             * verdad (aunque el sondeo diga que no: puede que su identificador no sea el que supuse). */
+            else if (async_all_done()) { dbg_log("carga lista: pruebo audsrv_init"); audio_start(); }
         }
         if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */
