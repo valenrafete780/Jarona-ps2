@@ -20,6 +20,7 @@
 #include <gsKit.h>
 #include <dmaKit.h>
 #include <libpad.h>
+#include <libcdvd.h>
 #include <sbv_patches.h>
 #include <audsrv.h>
 
@@ -295,7 +296,7 @@ void gfx_end(void)
 /* =============================== hilos auxiliares =============================== */
 /* audsrv_init() y padInit() esperan SIN limite a que su modulo del IOP responda. Si no responde, quien los llame se
  * queda colgado para siempre. Por eso van en hilos de BAJA prioridad: el juego nunca depende de ellos para arrancar. */
-static void start_thread(void (*fn)(void *), void *stack, int size, int prio)
+static int start_thread(void (*fn)(void *), void *stack, int size, int prio)
 {
     ee_thread_t th;
     memset(&th, 0, sizeof th);
@@ -305,8 +306,10 @@ static void start_thread(void (*fn)(void *), void *stack, int size, int prio)
     th.gp_reg = &_gp;
     th.initial_priority = prio;
     int id = CreateThread(&th);
-    if (id < 0) { printf("JARONA: no pude crear un hilo\n"); return; }
-    StartThread(id, NULL);
+    if (id < 0) { dbg_log("ERROR: CreateThread=%d (prio %02X)", id, prio); return id; }
+    int r = StartThread(id, NULL);
+    if (r < 0) dbg_log("ERROR: StartThread=%d", r);
+    return id;
 }
 
 /* =============================== carga en segundo plano =============================== */
@@ -369,6 +372,11 @@ static void audio_thread(void *arg)
 {
     (void)arg;
     audio_stage = 1;
+    /* audsrv 0.93 inicializa el reproductor de CD (cdda) y habla con cdvdman: se inicializa el CDVD antes, como hacen los
+     * juegos. Va DENTRO de este hilo: si algo se cuelga, solo se cuelga el audio. */
+    dbg_log("sceCdInit...");
+    sceCdInit(0);
+    dbg_log("sceCdInit hecho");
     dbg_log("audsrv_init: llamando...");
     int r = audsrv_init();
     if (r != 0) {
@@ -406,7 +414,8 @@ static int audsrv_bound(void)
 static void audio_start(void)
 {
     audio_thread_started = 1;
-    start_thread(audio_thread, audio_stack, sizeof audio_stack, 0x50);   /* por encima del cargador (0x58): el servidor ya existe, la init es rapida */
+    int id = start_thread(audio_thread, audio_stack, sizeof audio_stack, 0x60);   /* 0x60: la prioridad con la que el hilo SI llego a ejecutarse */
+    dbg_log("hilo de audio id=%d", id);
 }
 
 /* =============================== mando =============================== */
@@ -544,13 +553,14 @@ int main(int argc, char **argv)
         g_frames = frames;
         if (pad_ready && !pad_logged) { pad_logged = 1; dbg_log("mando OK (cuadro %d)", frames); }
         if (audio_ready && !audio_logged) { audio_logged = 1; dbg_log("AUDIO OK (cuadro %d)", frames); }
-        if (!audio_thread_started && frames % 15 == 0) {
+        if (!audio_ready && frames % 15 == 0) {
             int b = audsrv_bound();
             if (b != last_bound) { last_bound = b; dbg_log("servidor audsrv: %s", b > 0 ? "EXISTE" : (b == 0 ? "NO existe" : "ERROR")); }
-            if (b > 0) audio_start();
-            /* Con TODA la carga terminada el hilo de lectura ya no acapara el procesador: ahora si se prueba audsrv_init de
-             * verdad (aunque el sondeo diga que no: puede que su identificador no sea el que supuse). */
-            else if (async_all_done()) { dbg_log("carga lista: pruebo audsrv_init"); audio_start(); }
+            if (!audio_thread_started) {
+                if (b > 0) audio_start();
+                /* con TODA la carga terminada el hilo de lectura ya no acapara el procesador: ahora si se prueba audsrv_init */
+                else if (async_all_done()) { dbg_log("carga lista: pruebo audsrv_init"); audio_start(); }
+            }
         }
         if (audio_failed) { audio_failed = 0; audio_thread_started = 0; }
         game_frame((uint32_t)clock_ms, &in);                         /* dibuja y espera al vsync (gfx_end) */
