@@ -24,7 +24,7 @@ EE_CFLAGS += -DHAVE_FREESD
 endif
 EE_INCS   += -Isrc -I$(PS2DEV)/gsKit/include -I$(PS2SDK)/ports/include
 EE_LDFLAGS += -L$(PS2DEV)/gsKit/lib -L$(PS2SDK)/ports/lib
-EE_LIBS   += -lgskit -ldmakit -laudsrv -lpad -lpatches -lm
+EE_LIBS   += -lgskit -ldmakit -laudsrv -lpad -lpatches -lcdvd -lm
 
 vpath %.c src
 
