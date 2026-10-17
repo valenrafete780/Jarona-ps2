@@ -170,11 +170,38 @@ static void draw_bar_screen(int show_title, float frac);
 
 /* ---- carga en segundo plano (hilo aparte): musica (4 MB), pista secreta (1.3 MB) y arbol secreto (0.7 MB) ---- */
 /* Orden: primero el arbol (0.7 MB, lo unico que necesita la escena secreta), luego la musica y la pista secreta */
+/* tamanos aproximados (MB) para repartir la barra de carga */
+#define STARTUP_MB 1.5f
+static const float BG_MB[3] = { 0.66f, 4.04f, 1.25f };
+#define TOTAL_MB (STARTUP_MB + 0.66f + 4.04f + 1.25f)
 static const char *const BG_FILES[3] = { "TREE.DAT", "MUSICA.ULW", "SECRETO.ULW" };
 static int bg_done[3];
 static int music_wanted, music_loaded, tree_ready;
 
 static void tree_init(const uint8_t *d, uint32_t size);
+
+static float load_disp;              /* progreso mostrado (suavizado) */
+static int32_t files_done_at = -1;   /* instante en que terminaron de leerse los tres ficheros */
+static int start_ready;              /* la pantalla de carga ya termino: se puede pulsar "¡Empezar!" */
+
+static int all_bg_done(void) { return bg_done[0] && bg_done[1] && bg_done[2]; }
+
+/* progreso real de la carga total (0..1) */
+static float load_fraction(void)
+{
+    float acc = STARTUP_MB;
+    for (int i = 0; i < 3; i++) {
+        float p = 1.0f;
+        if (!bg_done[i]) {
+            uint32_t d = 0, t = 0;
+            plat_async_progress(i, &d, &t);
+            p = t ? (float)d / (float)t : 0.0f;
+        }
+        acc += p * BG_MB[i];
+    }
+    float f = acc / TOTAL_MB;
+    return f > 1.0f ? 1.0f : f;
+}
 
 static void bg_poll(void)
 {
@@ -215,7 +242,7 @@ static void *load_item(int i, uint32_t *size)
 int game_load(void)
 {
     SW = gfx_width(); SH = gfx_height();
-    total_weight = 0; for (int i = 0; i < N_ITEMS; i++) total_weight += ITEMS[i].weight;
+    total_weight = TOTAL_MB;                                  /* la barra mide todo: arranque + musica + pista secreta + arbol */
 
     /* 1) texturas */
     item_base = 0; cur_show_title = 0;
@@ -268,7 +295,7 @@ int game_load(void)
         item_base += ITEMS[1].weight;
         draw_bar_screen(1, item_base / total_weight);
     }
-    draw_bar_screen(1, 1.0f);
+    draw_bar_screen(1, STARTUP_MB / TOTAL_MB);
     plat_async_begin(BG_FILES, 3);                           /* la musica y el arbol llegan mientras ya se ve el juego */
     gstate = G_START;
     return 0;
@@ -701,16 +728,21 @@ static void draw_scene(void)
     gfx_end();
 }
 
-static void draw_start_screen(void)
+static void draw_start_screen(float frac, int ready)
 {
     gfx_begin(BG_R, BG_G, BG_B);
     float bw = SW * 0.7f; if (bw > 520) bw = 520;
     float bx = (SW - bw) / 2, by = SH * 0.38f;
     draw_tex_xywh(&t_title, (SW - t_title.w) / 2.0f, by - t_title.h - 28, (float)t_title.w, (float)t_title.h, 1);
     gfx_rect(bx, by, bw, 28, 59, 31, 0, 1);
-    gfx_rect(bx + 4, by + 4, bw - 8, 20, 59, 31, 0, 1);
-    const Tex *b = (g_now / 400) % 2 ? &t_start_p : &t_start;      /* el boton "respira" para que se vea que espera */
-    draw_tex_xywh(b, (SW - b->w) / 2.0f, by + 28 + 22.0f, (float)b->w, (float)b->h, 1);
+    gfx_rect(bx + 4, by + 4, bw - 8, 20, 255, 243, 166, 1);
+    gfx_rect(bx + 4, by + 4, (bw - 8) * clamp01(frac), 20, 59, 31, 0, 1);
+    if (!ready) {
+        draw_tex_xywh(&t_loading, (SW - t_loading.w) / 2.0f, by + 28 + 16, (float)t_loading.w, (float)t_loading.h, 1);
+    } else {
+        const Tex *b = (g_now / 400) % 2 ? &t_start_p : &t_start;      /* el boton "respira" para que se vea que espera */
+        draw_tex_xywh(b, (SW - b->w) / 2.0f, by + 28 + 22.0f, (float)b->w, (float)b->h, 1);
+    }
     gfx_end();
 }
 
@@ -720,9 +752,16 @@ void game_frame(uint32_t now_ms, const GameInput *in)
     if (SW == 0) { SW = gfx_width(); SH = gfx_height(); }
     if (gstate == G_START || gstate == G_PLAY) bg_poll();
     switch (gstate) {
-    case G_START:
-        draw_start_screen();
-        if (in->start_down || in->tap_down) {
+    case G_START: {
+        /* La pantalla de carga termina cuando TODO esta cargado (musica, pista secreta y arbol) y el sonido de la consola
+         * esta listo. Si el sonido no responde, se espera como maximo 8 s para no bloquear el juego. */
+        if (all_bg_done() && files_done_at < 0) files_done_at = g_now;
+        if (!start_ready && files_done_at >= 0 && (plat_audio_ready() || g_now - files_done_at > 8000)) start_ready = 1;
+        float target = start_ready ? 1.0f : load_fraction() * 0.97f;      /* no llega al 100% hasta estar de verdad listo */
+        load_disp += (target - load_disp) * 0.12f;                        /* avance suave, sin saltos */
+        if (start_ready && load_disp > 0.995f) load_disp = 1.0f;
+        draw_start_screen(load_disp, start_ready && load_disp >= 0.999f);
+        if ((in->start_down || in->tap_down) && start_ready && load_disp >= 0.999f) {
             gstate = G_PLAY;
             music_wanted = 1;
             if (music_loaded) mixer_music_start();                 /* la musica empieza aqui y ya no se detiene */
@@ -730,6 +769,7 @@ void game_frame(uint32_t now_ms, const GameInput *in)
             g_prev = g_now;
         }
         break;
+    }
     case G_PLAY:
         update(in);
         draw_scene();

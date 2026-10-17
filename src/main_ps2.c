@@ -65,11 +65,11 @@ static int open_data_fd(const char *name)
     return -1;
 }
 
-static long read_all(int fd, uint8_t *buf, long n, void (*progress)(uint32_t, uint32_t))
+static long read_all(int fd, uint8_t *buf, long n, void (*progress)(uint32_t, uint32_t), long chunk)
 {
     long done = 0;
     while (done < n) {
-        long k = n - done > 1048576 ? 1048576 : n - done;
+        long k = n - done > chunk ? chunk : n - done;
         long r = (long)read(fd, buf + done, (size_t)k);
         if (r <= 0) break;
         done += r;
@@ -86,7 +86,7 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
     lseek(fd, 0, SEEK_SET);
     uint8_t *buf = (n > 0) ? (uint8_t *)memalign(64, (size_t)n + 64) : NULL;
     if (!buf) { close(fd); return NULL; }
-    long done = read_all(fd, buf, n, progress);
+    long done = read_all(fd, buf, n, progress, 1048576);
     close(fd);
     if (done != n) { free(buf); return NULL; }
     *size = (uint32_t)n;
@@ -100,12 +100,8 @@ void *plat_load(const char *name, uint32_t *size, void (*progress)(uint32_t, uin
 static char logl[LOG_LINES][LOG_COLS + 1];
 static volatile int log_dirty;
 
-/* SELECT oculta/muestra los indicadores y el registro. Compilando con -DNO_DEBUG_DOTS arrancan ocultos. */
-#ifdef NO_DEBUG_DOTS
-static volatile int dbg_show = 0;
-#else
-static volatile int dbg_show = 1;
-#endif
+/* SELECT muestra/oculta los indicadores y el registro de diagnostico. */
+static volatile int dbg_show = 0;           /* oculto por defecto: SELECT lo muestra (indicadores y registro de diagnostico) */
 static volatile int g_frames;                       /* fotogramas desde que arranco el bucle principal (para marcar el tiempo) */
 
 static void dbg_log(const char *fmt, ...)
@@ -313,11 +309,14 @@ static int start_thread(void (*fn)(void *), void *stack, int size, int prio)
 }
 
 /* =============================== carga en segundo plano =============================== */
-typedef struct { void *data; uint32_t size; volatile int state; } ARes;      /* state: 0 pendiente, 1 listo, -1 fallo */
+typedef struct { void *data; uint32_t size; volatile int state; volatile uint32_t done, total; } ARes;      /* state: 0 pendiente, 1 listo, -1 fallo */
 static ARes ares[8];
 static const char *const *a_names;
 static int a_n;
 static u8 loader_stack[16 * 1024] __attribute__((aligned(16)));
+
+static volatile int cur_req;
+static void loader_progress(uint32_t d, uint32_t t) { ares[cur_req].done = d; ares[cur_req].total = t; }
 
 static void loader_thread(void *arg)
 {
@@ -329,7 +328,8 @@ static void loader_thread(void *arg)
         lseek(fd, 0, SEEK_SET);
         dbg_log("leyendo %s %ldK", a_names[i], n / 1024);
         uint8_t *buf = (n > 0) ? (uint8_t *)memalign(64, (size_t)n + 64) : NULL;
-        long done = buf ? read_all(fd, buf, n, NULL) : 0;
+        cur_req = i; ares[i].total = (uint32_t)n; ares[i].done = 0;
+        long done = buf ? read_all(fd, buf, n, loader_progress, 524288) : 0;      /* bloques de 512 KB: la barra avanza con suavidad */
         close(fd);
         if (!buf || done != n) { free(buf); dbg_log("%s: lectura incompleta", a_names[i]); ares[i].state = -1; continue; }
         ares[i].data = buf; ares[i].size = (uint32_t)n;
@@ -354,6 +354,15 @@ static int async_all_done(void)
     for (int i = 0; i < a_n; i++) if (ares[i].state == 0) return 0;
     return 1;
 }
+
+int plat_async_progress(int i, uint32_t *done, uint32_t *total)
+{
+    if (i < 0 || i >= a_n) return 0;
+    *done = ares[i].done; *total = ares[i].total;
+    return 1;
+}
+
+int plat_audio_ready(void) { return audio_ready; }
 
 int plat_async_poll(int i, void **data, uint32_t *size)
 {
@@ -461,6 +470,7 @@ static u32 pad_read(void)
 /* Cuadros verdes = etapas completadas. Si la pantalla se queda en N cuadros, el fallo esta justo despues. */
 static void stage_wait(int n)                                         /* un fotograma: n cuadros verdes + uno amarillo parpadeando */
 {
+    if (!dbg_show) { gfx_begin(255, 216, 61); gfx_end(); return; }
     gfx_begin(0, 0, 48);
     for (int i = 0; i < n; i++) gfx_rect(24.0f + i * 40, 24, 32, 32, 0, 255, 0, 1);
     gfx_rect(24.0f + n * 40, 24, 32, 32, 255, 220, 0, 1);
@@ -471,6 +481,7 @@ static void stage(int n, const char *msg)
 {
     printf("JARONA: etapa %d - %s\n", n, msg);
     for (int k = 0; k < 2; k++) {                                     /* 2 fotogramas: se ve en los dos buffers */
+        if (!dbg_show) { gfx_begin(255, 216, 61); gfx_end(); continue; }
         gfx_begin(0, 0, 48);
         for (int i = 0; i < n; i++) gfx_rect(24.0f + i * 40, 24, 32, 32, 0, 255, 0, 1);
         gfx_end();

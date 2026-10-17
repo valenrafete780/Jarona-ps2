@@ -27,5 +27,7 @@ void plat_log(const char *msg);
  * (En el emulador el disco lee a ~250 KB/s: leer en el hilo principal congelaba la animacion.) */
 void plat_async_begin(const char *const *names, int n);                 /* empieza a cargar names[0..n-1] en orden */
 int  plat_async_poll(int i, void **data, uint32_t *size);               /* 0 = aun no, 1 = listo (data/size), -1 = fallo */
+int  plat_async_progress(int i, uint32_t *done, uint32_t *total);       /* bytes leidos y total del fichero i (total 0 = aun no empezo) */
+int  plat_audio_ready(void);                                            /* 1 cuando el sistema de sonido de la consola ya esta listo */
 
 #endif
